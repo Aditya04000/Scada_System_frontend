@@ -1,0 +1,6 @@
+{
+  "name": "Servo Automation & HVAC Control System",
+  "description": "Real-time room temperature & humidity monitoring, automated servo motor valve controller, alarm logs, interactive graphs, and PDF report export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
