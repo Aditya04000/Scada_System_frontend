@@ -120,13 +120,13 @@ export const AutomationView: React.FC<AutomationViewProps> = ({
                 <th colSpan={5} className="border-r-2 border-white p-3 text-base md:text-lg font-black tracking-widest uppercase w-2/5 font-sans bg-amber-950/60 text-amber-300">
                   <div className="flex items-center justify-center gap-2">
                     {/* <Flame className="w-5 h-5 text-amber-400" /> */}
-                    <span>[Hot Supply] Actuator Control System</span>
+                    <span>[Hot Supply] Actuator Control🔥</span>
                   </div>
                 </th>
                 <th colSpan={5} className="p-3 text-base md:text-lg font-black tracking-widest uppercase w-2/5 font-sans bg-blue-950/60 text-blue-300">
                   <div className="flex items-center justify-center gap-2">
                     {/* <Snowflake className="w-5 h-5 text-cyan-400" /> */}
-                    <span>[Cold Supply] Actuator Control System</span>
+                    <span>[Cold Supply] Actuator Control❄️</span>
                   </div>
                 </th>
               </tr>

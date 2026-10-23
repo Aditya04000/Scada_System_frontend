@@ -42,7 +42,7 @@ export const AuditLogView: React.FC<AuditLogViewProps> = ({ auditLogs, userRole 
       <div className="w-full min-h-[calc(100vh-60px)] bg-[#181a22] p-4 md:p-8 text-white font-sans flex flex-col items-center justify-center gap-3">
         <ShieldAlert className="w-10 h-10 text-amber-500" />
         <span className="text-sm font-black uppercase tracking-wider text-gray-300">Admin Permission Required</span>
-        <span className="text-xs text-gray-500 font-mono">Audit logs are only visible to Admin accounts.</span>
+        <span className="text-xs text-gray-500 font-mono">Audit logs are only visible to Admin.</span>
       </div>
     );
   }
@@ -56,7 +56,7 @@ export const AuditLogView: React.FC<AuditLogViewProps> = ({ auditLogs, userRole 
             <span>AUDIT LOG</span>
           </h1>
           <p className="text-xs text-gray-400 font-mono mt-1">
-            Every action, who performed it, and when — devices, relays, valves, rules, users, alarms.
+            Every action, who performed it, and when — devices,  rules, login, users.
           </p>
         </div>
         <div className="bg-[#12131b] border border-gray-700 px-3 py-1.5 rounded text-xs font-mono">

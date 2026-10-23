@@ -56,7 +56,7 @@ export const DhuControlView: React.FC<DhuControlViewProps> = ({ devices, onToggl
             <span>SYSTEM CONTROL PANEL</span>
           </h1>
           <p className="text-xs text-gray-400 font-mono mt-1">
-            Relay control  
+            Power Relay control  
           </p>
         </div>
 

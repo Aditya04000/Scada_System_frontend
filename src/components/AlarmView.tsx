@@ -9,8 +9,6 @@ import {
   CheckCheck,
   History,
   Activity,
-  Clock,
-  Trash2,
   Search,
   FileText,
   ShieldCheck,
@@ -21,7 +19,8 @@ interface AlarmViewProps {
   alarms: AlarmLog[];
   onAcknowledgeAlarm: (id: string) => void;
   onAcknowledgeAll: () => void;
-  onSimulateAlarm: () => void;
+  onSimulateAlarm?: () => void;
+  onDeleteAlarm?: (id: string) => void;
   onNavigateToReport?: () => void;
 }
 
@@ -41,7 +40,7 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
 
   const nowMs = Date.now();
 
-  // Enforce 1-Year Retention Filter (records <= 365 days old)
+  // Enforce 1-Year Retention Filter (backend also purges; this is a UI guard)
   const validRetainedAlarms = alarms.filter((a) => {
     if (!a.timestamp) return true;
     return nowMs - a.timestamp <= ONE_YEAR_MS;
@@ -49,17 +48,10 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
 
   const expiredCount = alarms.length - validRetainedAlarms.length;
 
-  // REALTIME = Still active (category REALTIME), even if acknowledged
-  // PAST = Resolved (condition returned to normal)
-  const realtimeAlarms = validRetainedAlarms.filter(
-    (a) => a.category === 'REALTIME'
-  );
+  // REALTIME = still active. PAST = resolved (moved here by backend)
+  const realtimeAlarms = validRetainedAlarms.filter((a) => a.category === 'REALTIME');
+  const pastAlarms = validRetainedAlarms.filter((a) => a.category === 'PAST');
 
-  const pastAlarms = validRetainedAlarms.filter(
-    (a) => a.category === 'PAST'
-  );
-
-  // Filter Realtime Alarms
   const filteredRealtimeAlarms = realtimeAlarms.filter((a) => {
     if (filterSeverity === 'UNACKNOWLEDGED') return !a.acknowledged;
     if (filterSeverity === 'HIGH') return a.lowHigh === 'High' || a.lowHigh === 'Critical';
@@ -75,14 +67,11 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
     return true;
   });
 
-  // Filter Past Alarms by Time Range and Search
   const filteredPastAlarms = pastAlarms.filter((a) => {
-    // Date Range
     if (a.timestamp) {
       const daysOld = (nowMs - a.timestamp) / (1000 * 60 * 60 * 24);
       if (daysOld > pastTimeRange) return false;
     }
-    // Search
     if (searchQuery.trim() !== '') {
       const q = searchQuery.toLowerCase();
       return (
@@ -107,11 +96,10 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
             <span>ALARM MANAGEMENT SYSTEM</span>
           </h1>
           <p className="text-xs text-gray-400 font-mono mt-1">
-            Dual Telemetry Monitoring: Active Realtime Breaches.
+            Active realtime breaches clear automatically when readings return to range.
           </p>
         </div>
 
-        {/* Global Actions */}
         <div className="flex flex-wrap items-center gap-2 font-mono">
           <button
             onClick={onAcknowledgeAll}
@@ -122,37 +110,38 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
             <span>ACK ALL ({unackCount})</span>
           </button>
 
-          <button
-            onClick={onSimulateAlarm}
-            id="simulate-alarm-btn"
-            className="flex items-center gap-1.5 px-3 py-2 bg-gradient-to-r from-red-700 to-rose-600 hover:from-red-600 hover:to-rose-500 text-white text-xs font-bold uppercase rounded border border-red-400 cursor-pointer shadow transition-all"
-          >
-            <Plus className="w-4 h-4" />
-            <span>TRIGGER TEST ALARM</span>
-          </button>
+          {onSimulateAlarm && (
+            <button
+              onClick={onSimulateAlarm}
+              id="simulate-alarm-btn"
+              className="flex items-center gap-1.5 px-3 py-2 bg-gradient-to-r from-red-700 to-rose-600 hover:from-red-600 hover:to-rose-500 text-white text-xs font-bold uppercase rounded border border-red-400 cursor-pointer shadow transition-all"
+            >
+              <Plus className="w-4 h-4" />
+              <span>TRIGGER TEST ALARM</span>
+            </button>
+          )}
         </div>
       </div>
 
-      {/* 365-Day Retention Policy & Status Banner */}
+      {/* Retention Policy Banner */}
       <div className="mb-6 bg-[#0f111a] border border-amber-900/80 p-4 rounded flex flex-wrap items-center justify-between gap-4 shadow-lg font-mono">
         <div className="flex items-center gap-3">
           <div className="p-2.5 bg-amber-950/80 border border-amber-600 rounded text-amber-400">
-            <ShieldCheck className="w-5 h-5 animate-pulse" />
+            <ShieldCheck className="w-5 h-5" />
           </div>
           <div>
             <div className="flex items-center gap-2 text-xs font-black text-amber-300 uppercase tracking-wider">
-              <span>AUTOMATIC DATA RETENTION POLICY ACTIVE</span>
+              <span>AUTOMATIC DATA RETENTION</span>
               <span className="px-2 py-0.5 bg-emerald-950 text-emerald-300 border border-emerald-600 rounded text-[10px]">
                 AUTO-PURGE ENGINE RUNNING
               </span>
             </div>
             <p className="text-[11px] text-gray-400 mt-0.5">
-              All alarm records are stored securely for 1 Year.
+              Alarm records are stored securely.
             </p>
           </div>
         </div>
 
-        {/* Retention Statistics */}
         <div className="flex items-center gap-4 text-xs">
           <div className="bg-[#181a26] px-3 py-1.5 rounded border border-gray-700 text-center">
             <span className="block text-[10px] text-gray-400 uppercase">REALTIME ACTIVE</span>
@@ -163,13 +152,13 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
             <span className="text-sm font-black text-cyan-400">{pastAlarms.length}</span>
           </div>
           <div className="bg-[#181a26] px-3 py-1.5 rounded border border-gray-700 text-center">
-            <span className="block text-[10px] text-gray-400 uppercase">AUTO-PURGED (&gt;365d)</span>
+            <span className="block text-[10px] text-gray-400 uppercase">AUTO-PURGED</span>
             <span className="text-sm font-black text-gray-500">{expiredCount}</span>
           </div>
         </div>
       </div>
 
-      {/* Sub-Tabs Switcher Header */}
+      {/* Sub-Tabs Switcher */}
       <div className="mb-4 flex flex-wrap items-center justify-between gap-4 bg-[#12131c] p-2 rounded border border-gray-700 font-mono">
         <div className="flex items-center gap-2">
           <button
@@ -202,7 +191,6 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
           </button>
         </div>
 
-        {/* Search Input */}
         <div className="flex items-center gap-2 bg-[#090a10] px-3 py-1.5 rounded border border-gray-700 w-full sm:w-64">
           <Search className="w-3.5 h-3.5 text-gray-400" />
           <input
@@ -218,7 +206,6 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
       {/* --- SUB-TAB 1: REALTIME ALARMS --- */}
       {activeSubTab === 'REALTIME' && (
         <div>
-          {/* Filter Toolbar for Realtime */}
           <div className="mb-4 flex items-center gap-2 bg-[#0a0b12] p-2.5 rounded border border-gray-800 text-xs font-mono">
             <Filter className="w-4 h-4 text-gray-400" />
             <span className="text-gray-300 uppercase font-bold">Severity Filter:</span>
@@ -239,7 +226,6 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
             </div>
           </div>
 
-          {/* Realtime Alarms Table */}
           <div className="w-full overflow-x-auto border border-gray-700 bg-[#0d0e15] shadow-2xl rounded-sm">
             <table className="w-full text-left font-mono border-collapse">
               <thead>
@@ -257,7 +243,7 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
                 {filteredRealtimeAlarms.length === 0 ? (
                   <tr>
                     <td colSpan={6} className="p-8 text-center text-gray-500 italic">
-                      No active realtime alarms matching filter criteria.
+                      No active realtime alarms. All readings are within range😉.
                     </td>
                   </tr>
                 ) : (
@@ -273,7 +259,6 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
                             : 'bg-[#11121b] text-gray-300 hover:bg-[#191b28]'
                         }`}
                       >
-                        {/* Alarm Name & ID */}
                         <td className="p-3 font-bold flex items-center gap-2">
                           <AlertTriangle
                             className={`w-4 h-4 shrink-0 ${
@@ -291,16 +276,13 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
                           </div>
                         </td>
 
-                        {/* Device */}
                         <td className="p-3 font-extrabold text-blue-300">{alm.device}</td>
 
-                        {/* Parameter & Value */}
                         <td className="p-3">
                           <span className="block text-gray-200">{alm.parameter}</span>
                           <span className="text-xs text-amber-300 font-bold">{alm.value}</span>
                         </td>
 
-                        {/* Low/High */}
                         <td className="p-3">
                           <span
                             className={`px-2 py-0.5 rounded text-[10px] font-black uppercase inline-block ${
@@ -315,10 +297,8 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
                           </span>
                         </td>
 
-                        {/* Time&Date */}
                         <td className="p-3 text-gray-400">{alm.timeDate}</td>
 
-                        {/* Status & Acknowledge Action */}
                         <td className="p-3 text-center">
                           {!alm.acknowledged ? (
                             <button
@@ -347,7 +327,6 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
       {/* --- SUB-TAB 2: PAST ALARMS --- */}
       {activeSubTab === 'PAST' && (
         <div>
-          {/* Past Alarms Range Filter Controls */}
           <div className="mb-4 flex flex-wrap items-center justify-between gap-4 bg-[#0a0b12] p-3 rounded border border-gray-800 text-xs font-mono">
             <div className="flex items-center gap-2">
               <Calendar className="w-4 h-4 text-cyan-400" />
@@ -358,7 +337,7 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
                   { label: 'LAST 7 DAYS', days: 7 },
                   { label: 'LAST 30 DAYS', days: 30 },
                   { label: 'LAST 90 DAYS', days: 90 },
-                  { label: 'FULL 1 YEAR (365D)', days: 365 },
+                  { label: 'FULL 1 YEAR', days: 365 },
                 ].map((range) => (
                   <button
                     key={range.days}
@@ -375,7 +354,6 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
               </div>
             </div>
 
-            {/* Export PDF Link */}
             {onNavigateToReport && (
               <button
                 onClick={onNavigateToReport}
@@ -387,7 +365,6 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
             )}
           </div>
 
-          {/* Past Alarms Table */}
           <div className="w-full overflow-x-auto border border-gray-700 bg-[#0d0e15] shadow-2xl rounded-sm">
             <table className="w-full text-left font-mono border-collapse">
               <thead>
@@ -395,8 +372,7 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
                   <th className="p-3 w-1/4">Past Alarm Title</th>
                   <th className="p-3 w-1/6">Device</th>
                   <th className="p-3 w-1/5">Parameter & Peak Value</th>
-                  <th className="p-3 w-1/6">Trigger Time / Cleared</th>
-                  <th className="p-3 w-1/6">Retention Status</th>
+                  <th className="p-3 w-1/4">Trigger Time / Cleared</th>
                   <th className="p-3 w-20 text-center">Archive Log</th>
                 </tr>
               </thead>
@@ -404,75 +380,49 @@ export const AlarmView: React.FC<AlarmViewProps> = ({
               <tbody className="divide-y divide-gray-800 text-xs">
                 {filteredPastAlarms.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="p-8 text-center text-gray-500 italic">
-                      No historical past alarm records stored for the selected time window ({pastTimeRange} Days).
+                    <td colSpan={5} className="p-8 text-center text-gray-500 italic">
+                      No resolved alarm history for the selected time window ({pastTimeRange} days).
                     </td>
                   </tr>
                 ) : (
-                  filteredPastAlarms.map((alm) => {
-                    const daysOld = alm.timestamp
-                      ? Math.floor((nowMs - alm.timestamp) / (1000 * 60 * 60 * 24))
-                      : 0;
-                    const daysRemaining = Math.max(0, 365 - daysOld);
-
-                    return (
-                      <tr key={alm.id} className="bg-[#11121b] text-gray-300 hover:bg-[#191b28] transition-colors">
-                        {/* Alarm Name & ID */}
-                        <td className="p-3 font-bold flex items-center gap-2">
-                          <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
-                          <div>
-                            <span className="block text-gray-100 text-sm font-black">{alm.alarmName}</span>
-                            <span className="text-[10px] text-gray-400 flex items-center gap-2">
-                              <span>{alm.id}</span>
-                              <span className="px-1.5 py-0.2 bg-blue-950 text-cyan-300 border border-cyan-800 rounded text-[9px] uppercase">
-                                ARCHIVED PAST ALARM
-                              </span>
+                  filteredPastAlarms.map((alm) => (
+                    <tr key={alm.id} className="bg-[#11121b] text-gray-300 hover:bg-[#191b28] transition-colors">
+                      <td className="p-3 font-bold flex items-center gap-2">
+                        <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <div>
+                          <span className="block text-gray-100 text-sm font-black">{alm.alarmName}</span>
+                          <span className="text-[10px] text-gray-400 flex items-center gap-2">
+                            <span>{alm.id}</span>
+                            <span className="px-1.5 py-0.2 bg-blue-950 text-cyan-300 border border-cyan-800 rounded text-[9px] uppercase">
+                              RESOLVED
                             </span>
-                          </div>
-                        </td>
-
-                        {/* Device */}
-                        <td className="p-3 font-extrabold text-cyan-300">{alm.device}</td>
-
-                        {/* Parameter & Value */}
-                        <td className="p-3">
-                          <span className="block text-gray-300">{alm.parameter}</span>
-                          <span className="text-xs text-amber-300 font-bold">{alm.value}</span>
-                        </td>
-
-                        {/* Trigger Time & Cleared */}
-                        <td className="p-3">
-                          <div className="text-gray-300 font-bold">{alm.timeDate}</div>
-                          {alm.clearedAt && (
-                            <div className="text-[10px] text-emerald-400">
-                              Resolved: {alm.clearedAt}
-                            </div>
-                          )}
-                        </td>
-
-                        {/* 1-Year Retention Status */}
-                        <td className="p-3">
-                          <div className="flex items-center gap-1.5 text-xs text-amber-300 font-bold">
-                            <Clock className="w-3.5 h-3.5 text-amber-400" />
-                            <span>Auto-Deletes in {daysRemaining}d</span>
-                          </div>
-                          <div className="w-28 bg-gray-800 h-1.5 rounded-full mt-1 overflow-hidden">
-                            <div
-                              className="bg-amber-500 h-full rounded-full"
-                              style={{ width: `${Math.min(100, (daysRemaining / 365) * 100)}%` }}
-                            />
-                          </div>
-                        </td>
-
-                        {/* Status */}
-                        <td className="p-3 text-center">
-                          <span className="px-2 py-0.5 bg-gray-800 text-gray-300 border border-gray-600 rounded text-[10px] font-bold uppercase inline-block">
-                            STORED (1YR)
                           </span>
-                        </td>
-                      </tr>
-                    );
-                  })
+                        </div>
+                      </td>
+
+                      <td className="p-3 font-extrabold text-cyan-300">{alm.device}</td>
+
+                      <td className="p-3">
+                        <span className="block text-gray-300">{alm.parameter}</span>
+                        <span className="text-xs text-amber-300 font-bold">{alm.value}</span>
+                      </td>
+
+                      <td className="p-3">
+                        <div className="text-gray-300 font-bold">{alm.timeDate}</div>
+                        {alm.clearedAt && (
+                          <div className="text-[10px] text-emerald-400">
+                            Resolved: {alm.clearedAt}
+                          </div>
+                        )}
+                      </td>
+
+                      <td className="p-3 text-center">
+                        <span className="px-2 py-0.5 bg-gray-800 text-gray-300 border border-gray-600 rounded text-[10px] font-bold uppercase inline-block">
+                          STORED (1YR)
+                        </span>
+                      </td>
+                    </tr>
+                  ))
                 )}
               </tbody>
             </table>

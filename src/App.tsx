@@ -50,6 +50,11 @@ const DEFAULT_SCAN_SUBNET = '192.168.137';
 const SUBNET_SAVE_DEBOUNCE_MS = 600;
 const LOAD_RETRY_MS = 15000;
 
+// How long a breach must persist before we write it to the database.
+// Breaches resolved within this window never reach the backend and never
+// appear in Past Alarms — they show live in the Realtime tab and vanish.
+const ALARM_PERSIST_DELAY_MS = 60_000;
+
 type ThresholdKey = 'tempHigh' | 'tempLow' | 'humHigh' | 'humLow';
 
 const THRESHOLD_KEYS: ThresholdKey[] = ['tempHigh', 'tempLow', 'humHigh', 'humLow'];
@@ -125,8 +130,13 @@ export default function App() {
   const [isLiveUpdating, setIsLiveUpdating] = useState<boolean>(true);
   const [selectedServoDevice, setSelectedServoDevice] = useState<DeviceData | null>(null);
 
-  // CRITICAL: Track which devices are unreachable so we STOP polling them
+  // Track which devices are unreachable so we STOP polling them
   const unreachableDevicesRef = useRef<Set<string>>(new Set());
+
+  // Debounced alarm persistence — a breach must be active for
+  // ALARM_PERSIST_DELAY_MS before it is written to the database.
+  const breachStartRef = useRef<Record<string, Record<ThresholdKey, number>>>({});
+  const pendingPersistTimersRef = useRef<Record<string, Record<ThresholdKey, number | null>>>({});
 
   const devicesRef = useRef<DeviceData[]>(devices);
   useEffect(() => {
@@ -198,11 +208,11 @@ export default function App() {
       const fleet = fleetRes.value;
       setDevices((prev) => mergeFleet(prev, fleet));
       setIsFleetLoaded(true);
-      
-      // CRITICAL: Only initialize history if device has REAL data
+
+      // Only initialize history if device has REAL data
       const now = Date.now();
       const initialHistory: Record<string, HistoryDataPoint[]> = {};
-      
+
       fleet.forEach((device) => {
         if (device.tempReal !== null && device.humidityReal !== null) {
           initialHistory[device.id] = [
@@ -218,7 +228,7 @@ export default function App() {
           ];
         }
       });
-      
+
       setDeviceHistory((prev) => ({
         ...prev,
         ...initialHistory,
@@ -299,6 +309,14 @@ export default function App() {
     lastHistorySampleRef.current = {};
     didInitialScanRef.current = false;
     unreachableDevicesRef.current.clear();
+    // Cancel any pending persist timers and clear debounce state
+    for (const deviceMap of Object.values(pendingPersistTimersRef.current)) {
+      for (const timer of Object.values(deviceMap)) {
+        if (timer !== null && timer !== undefined) window.clearTimeout(timer);
+      }
+    }
+    pendingPersistTimersRef.current = {};
+    breachStartRef.current = {};
   }, []);
 
   useEffect(() => {
@@ -433,7 +451,7 @@ export default function App() {
         setLastScanResult({ ...result, timestamp: new Date().toLocaleTimeString(), automatic });
         return result;
       }
-      
+
       const messages: string[] = [];
       let assigned = 0;
       let updated = 0;
@@ -441,7 +459,7 @@ export default function App() {
       for (const scanned of found) {
         const mac = (scanned.telemetry.mac || '').toUpperCase();
         const reportedHostname = scanned.telemetry.hostname && scanned.telemetry.hostname.trim();
-        
+
         if (!mac && !reportedHostname) {
           messages.push(`${scanned.ip} responded but sent no MAC or hostname — skipped.`);
           continue;
@@ -449,7 +467,7 @@ export default function App() {
 
         try {
           let deviceToUpdate = null;
-          
+
           if (reportedHostname) {
             const hostnameMatch = devicesRef.current.find(
               (d) => d.hostname?.toLowerCase().replace(/\.local$/, '') === reportedHostname.toLowerCase().replace(/\.local$/, '')
@@ -459,7 +477,7 @@ export default function App() {
               console.log(`[SCAN] Matched by hostname: ${deviceToUpdate.id} → ${reportedHostname}`);
             }
           }
-          
+
           if (!deviceToUpdate && mac) {
             const macMatch = devicesRef.current.find(
               (d) => d.macAddress?.toUpperCase() === mac
@@ -472,22 +490,22 @@ export default function App() {
 
           if (deviceToUpdate) {
             const patch: DevicePatch = {};
-            
+
             if (!deviceToUpdate.hostname) {
               patch.ipAddress = scanned.ip;
             }
-            
+
             if (scanned.telemetry.firmwareVersion) {
               patch.firmwareVersion = scanned.telemetry.firmwareVersion;
             }
-            
+
             if (Object.keys(patch).length > 0) {
               const updatedDevice = await devicesApi.update(deviceToUpdate.id, patch);
               applyServerDevice(updatedDevice);
             }
-            
+
             unreachableDevicesRef.current.delete(deviceToUpdate.id);
-            
+
             updated++;
             messages.push(
               `${deviceToUpdate.id}: connected to ${reportedHostname ? reportedHostname + '.local' : scanned.ip}`
@@ -839,29 +857,108 @@ export default function App() {
 
   const openBreachesRef = useRef<Record<string, Record<ThresholdKey, boolean>>>({});
 
-  const raiseAlarm = useCallback(async (input: RaiseAlarmInput & { breachKey: ThresholdKey }) => {
+  /**
+   * Plays a short 880 Hz tone once. Called when an alarm is finally
+   * written to the database (after the persistence debounce).
+   */
+  const playAlertBeep = () => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.4);
+      osc.onended = () => ctx.close();
+    } catch {
+      // Audio not available in this browser/context — visual alarm still works
+    }
+  };
+
+  /**
+   * Writes an alarm to the database. Only called after the breach has
+   * already been active for ALARM_PERSIST_DELAY_MS.
+   */
+  const persistAlarmNow = useCallback(async (input: RaiseAlarmInput & { breachKey: ThresholdKey }) => {
     try {
       const existingAlarm = alarms.find(
-        (a) => a.device === input.device && 
-               a.parameter === input.parameter && 
+        (a) => a.device === input.device &&
+               a.parameter === input.parameter &&
                a.category === 'REALTIME'
       );
-      
+
       if (existingAlarm) {
         console.log(`[ALARM] Active alarm already exists for ${input.device} ${input.parameter}, skipping duplicate`);
         return;
       }
-      
-      const { alarm, created } = await alarmsApi.raise(input);
+
+      const { alarm } = await alarmsApi.raise(input);
       setAlarms((prev) => mergeAlarms(prev, [alarm]));
+      playAlertBeep();
+      console.log(`[ALARM] Persisted to DB after ${ALARM_PERSIST_DELAY_MS / 1000}s: ${input.alarmName} on ${input.device}`);
     } catch (err) {
       const state = openBreachesRef.current[input.device];
       if (state) state[input.breachKey] = false;
-      console.error(`[API] Could not raise ${input.alarmName} for ${input.device}:`, errorMessage(err));
+      console.error(`[API] Could not persist ${input.alarmName} for ${input.device}:`, errorMessage(err));
     }
   }, [alarms]);
 
+  /**
+   * Debounced alarm raise: schedules a database write ALARM_PERSIST_DELAY_MS
+   * in the future. If the breach clears before then, clearAlarms cancels the
+   * timer and nothing is ever stored.
+   */
+  const raiseAlarm = useCallback((input: RaiseAlarmInput & { breachKey: ThresholdKey }) => {
+    const { device, breachKey } = input;
+
+    // Already scheduled? Don't double-schedule.
+    const existingTimer = pendingPersistTimersRef.current[device]?.[breachKey];
+    if (existingTimer !== null && existingTimer !== undefined) {
+      return;
+    }
+
+    breachStartRef.current[device] = breachStartRef.current[device] || {};
+    breachStartRef.current[device][breachKey] = Date.now();
+
+    pendingPersistTimersRef.current[device] = pendingPersistTimersRef.current[device] || {};
+
+    const timer = window.setTimeout(() => {
+      pendingPersistTimersRef.current[device][breachKey] = null;
+
+      // Confirm the breach is still open at fire time
+      const stillOpen = openBreachesRef.current[device]?.[breachKey] === true;
+      if (stillOpen) {
+        void persistAlarmNow(input);
+      } else {
+        console.log(`[ALARM] Breach resolved under ${ALARM_PERSIST_DELAY_MS / 1000}s — not stored: ${input.alarmName} on ${device}`);
+      }
+    }, ALARM_PERSIST_DELAY_MS);
+
+    pendingPersistTimersRef.current[device][breachKey] = timer;
+  }, [persistAlarmNow]);
+
   const clearAlarms = useCallback(async (device: string, breachKey?: ThresholdKey) => {
+    // Cancel any pending persist timer for this breach — nothing to write.
+    const keysToCancel: ThresholdKey[] = breachKey ? [breachKey] : [...THRESHOLD_KEYS];
+    for (const key of keysToCancel) {
+      const timer = pendingPersistTimersRef.current[device]?.[key];
+      if (timer !== null && timer !== undefined) {
+        window.clearTimeout(timer);
+        pendingPersistTimersRef.current[device][key] = null;
+      }
+      if (breachStartRef.current[device]) {
+        delete breachStartRef.current[device][key];
+      }
+    }
+
     try {
       const closed = await alarmsApi.resolve(device, breachKey);
       setAlarms((prev) => mergeAlarms(prev, closed));
@@ -918,9 +1015,9 @@ export default function App() {
 
           if (!fresh.isOnline) {
             unreachableDevicesRef.current.add(deviceId);
-            patches[deviceId] = { 
-              tempReal: null, 
-              humidityReal: null 
+            patches[deviceId] = {
+              tempReal: null,
+              humidityReal: null
             };
           } else {
             unreachableDevicesRef.current.delete(deviceId);
@@ -931,9 +1028,6 @@ export default function App() {
               macAddress: fresh.macAddress,
               firmwareVersion: fresh.firmwareVersion,
               lastUpdated: fresh.lastUpdated,
-              // DO NOT update control fields from polling:
-              // hotValvePercent, coldValvePercent, hotValveAngle, coldValveAngle,
-              // autoAdjustEnabled, ahuPowerOn, dhu1On, dhu2On
             };
           }
 
@@ -959,7 +1053,7 @@ export default function App() {
             if (currentPercent === rule.targetValvePercent) return;
 
             const newAngle = (rule.targetValvePercent / 100) * 180;
-            
+
             if (isHot) {
               patches[deviceId] = {
                 ...patches[deviceId],
@@ -1061,20 +1155,18 @@ export default function App() {
             `${currentHum} % (Min ${prevDev.humidityMin} %)`
           );
 
-          // CRITICAL: Record history every 5 minutes for proper graph
+          // Record history every 5 minutes for proper graph
           const lastSample = lastHistorySampleRef.current[deviceId] || 0;
           if (nowDate.getTime() - lastSample >= HISTORY_SAMPLE_INTERVAL_MS && currentTemp !== null && currentHum !== null) {
             lastHistorySampleRef.current[deviceId] = nowDate.getTime();
-            // Use ESP32-reported angles for history (real data)
-            // NOT the user-controlled values
             newHistoryPoints[deviceId] = {
               time: nowDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
               timestamp: nowDate.getTime(),
               device: deviceId,
               temperature: currentTemp,
               humidity: currentHum,
-              hotServoAngle: fresh.hotValveAngle,  // REAL ESP32 angle
-              coldServoAngle: fresh.coldValveAngle, // REAL ESP32 angle
+              hotServoAngle: fresh.hotValveAngle,
+              coldServoAngle: fresh.coldValveAngle,
             };
             historySamples.push({
               device: deviceId,
@@ -1104,7 +1196,7 @@ export default function App() {
         }
 
         await Promise.all([
-          ...raiseIntents.map((intent) => raiseAlarm(intent)),
+          ...raiseIntents.map((intent) => Promise.resolve(raiseAlarm(intent))),
           ...clearIntents.map((intent) => clearAlarms(intent.device, intent.breachKey)),
           ...automationIntents.map((intent) => recordAutomation(intent)),
           ...valvePatches.map(async ({ device, patch }) => {

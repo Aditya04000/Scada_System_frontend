@@ -192,8 +192,8 @@ export const Esp32ConfigView: React.FC<Esp32ConfigViewProps> = ({
 #include <ESPmDNS.h>
 
 // ---------- WiFi ----------
-const char* WIFI_SSID = "ADITYA_";
-const char* WIFI_PASS = "Aditya123";
+const char* WIFI_SSID = "Your_WIFI_NAME";     
+const char* WIFI_PASS = "WIFI_PASSWORD";
 
 // Unique per physical board — e.g. "my-esp32-01", "my-esp32-02", ...
 // Must match the hostname entered in the dashboard's ESP32 CONFIG page.
@@ -541,7 +541,7 @@ void loop() {
             <span>ESP32 HARDWARE & NETWORK CONFIGURATION</span>
           </h1>
           <p className="text-xs text-gray-400 font-mono mt-1">
-            Configure ESP32 Wi-Fi IP addresses and access flashable C++ firmware code (Admin Only).
+            Configure ESP32 Wi-Fi IP addresses.
           </p>
         </div>
 
@@ -565,7 +565,7 @@ void loop() {
               }`}
             >
               <Lock className="w-3.5 h-3.5 text-amber-400" />
-              <span>ESP32 FIRMWARE C++ SOURCE CODE (ADMIN ONLY)</span>
+              <span>ESP32 FIRMWARE C++ SOURCE CODE</span>
             </button>
           )}
 
