@@ -1,4 +1,3 @@
-markdown
 # BECS HVAC Control System
 
 A production-grade, full-stack SCADA (Supervisory Control and Data Acquisition) dashboard designed to monitor and control HVAC infrastructure across a distributed fleet of ESP32 microcontrollers. 
@@ -48,6 +47,7 @@ The application is deliberately split into two distinct data paths:
 │  PostgreSQL │
 │  (Aiven)    │
 └─────────────┘
+
 Core Features
 Real-Time Monitoring: Live temperature and humidity readings, valve positions, and relay statuses updated every 3 seconds.
 
@@ -141,11 +141,15 @@ GPIO	Connected To
 26	Relay 1 (AHU Power)
 27	Relay 2 (DHU 1)
 14	Relay 3 (DHU 2)
+
+
 mDNS Configuration
 To ensure the dashboard finds the device without hardcoding IPs, the firmware must broadcast a unique hostname matching the device number:
 
 cpp
 const char* DEVICE_HOSTNAME = "my-esp32-01"; // For "Device 1"
+
+
 Local Development Setup
 Prerequisites
 Node.js (v18+)
@@ -159,6 +163,7 @@ Create a local database:
 
 sql
 CREATE DATABASE becs_hvac;
+
 2. Backend Setup
 bash
 cd backend
@@ -177,6 +182,8 @@ Initialize the database and start the server:
 bash
 npm run seed  # Creates tables, admin user, and 11 default devices
 npm start     # Starts server on http://localhost:4000
+
+
 3. Frontend Setup
 bash
 cd frontend
@@ -189,6 +196,8 @@ Start the development server:
 
 bash
 npm run dev   # Opens http://localhost:3000
+
+
 Cloud Deployment Guide
 To run this in production, use the following hosting setup:
 
