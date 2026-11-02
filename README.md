@@ -152,8 +152,8 @@ Create a .env file in the backend/ directory:
 env
 DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@localhost:5432/becs_hvac
 JWT_SECRET=generate_a_long_random_string_here
-ADMIN_EMAIL=admin@becs-hvac.com
-ADMIN_PASSWORD=admin123
+ADMIN_EMAIL=[Your email - any random name like]
+ADMIN_PASSWORD=[Your Password]
 PORT=4000
 NODE_ENV=development
 Initialize the database and start the server:
