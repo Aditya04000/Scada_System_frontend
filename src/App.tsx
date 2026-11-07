@@ -51,13 +51,56 @@ const SUBNET_SAVE_DEBOUNCE_MS = 600;
 const LOAD_RETRY_MS = 15000;
 
 // How long a breach must persist before we write it to the database.
-// Breaches resolved within this window never reach the backend and never
-// appear in Past Alarms — they show live in the Realtime tab and vanish.
 const ALARM_PERSIST_DELAY_MS = 60_000;
+
+// Session persistence (refresh-safe login)
+const SESSION_STORAGE_KEY = 'ctrl_hvac_session';
+const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 type ThresholdKey = 'tempHigh' | 'tempLow' | 'humHigh' | 'humLow';
 
 const THRESHOLD_KEYS: ThresholdKey[] = ['tempHigh', 'tempLow', 'humHigh', 'humLow'];
+
+type PersistedSession = {
+  email: string;
+  role: UserRole;
+  name: string;
+  loginTime: number;
+};
+
+function readPersistedSession(): PersistedSession | null {
+  try {
+    const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PersistedSession>;
+    if (!parsed?.email || !parsed?.loginTime) return null;
+    if (Date.now() - parsed.loginTime > SESSION_MAX_AGE_MS) return null;
+    return {
+      email: parsed.email,
+      role: (parsed.role as UserRole) || 'OPERATOR',
+      name: parsed.name || parsed.email,
+      loginTime: parsed.loginTime,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writePersistedSession(session: PersistedSession) {
+  try {
+    sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+  } catch {
+    // sessionStorage unavailable — user will simply need to log in after refresh
+  }
+}
+
+function clearPersistedSession() {
+  try {
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
 
 function isSavableSubnet(value: string): boolean {
   const raw = value.trim().replace(/\.$/, '');
@@ -129,9 +172,6 @@ export default function App() {
 
   const [isLiveUpdating, setIsLiveUpdating] = useState<boolean>(true);
   const [selectedServoDevice, setSelectedServoDevice] = useState<DeviceData | null>(null);
-
-  // Track which devices are unreachable so we STOP polling them
-  const unreachableDevicesRef = useRef<Set<string>>(new Set());
 
   // Debounced alarm persistence — a breach must be active for
   // ALARM_PERSIST_DELAY_MS before it is written to the database.
@@ -292,6 +332,7 @@ export default function App() {
   }, [isLoggedIn, activeTab, refreshAuditLog, currentUserRole]);
 
   const clearSessionState = useCallback(() => {
+    clearPersistedSession();
     setIsLoggedIn(false);
     setCurrentUserEmail('');
     setCurrentUserName('');
@@ -308,7 +349,6 @@ export default function App() {
     openBreachesRef.current = {};
     lastHistorySampleRef.current = {};
     didInitialScanRef.current = false;
-    unreachableDevicesRef.current.clear();
     // Cancel any pending persist timers and clear debounce state
     for (const deviceMap of Object.values(pendingPersistTimersRef.current)) {
       for (const timer of Object.values(deviceMap)) {
@@ -319,14 +359,36 @@ export default function App() {
     breachStartRef.current = {};
   }, []);
 
+  // ---------------------------------------------------------------
+  // RESTORE SESSION ON REFRESH
+  // ---------------------------------------------------------------
+  // Runs once on mount. If a persisted session exists (written by a
+  // successful login), restore the user and land them back on the
+  // dashboard. Only an explicit logout (handleLogout → clearSessionState)
+  // removes the stored session. No forced logout on refresh.
   useEffect(() => {
-    setIsLoggedIn(false);
-    setActiveTab('LOGIN');
+    const persisted = readPersistedSession();
+    if (!persisted) {
+      setIsLoggedIn(false);
+      setActiveTab('LOGIN');
+      return;
+    }
+    setCurrentUserEmail(persisted.email);
+    setCurrentUserName(persisted.name);
+    setCurrentUserRole(persisted.role);
+    setIsLoggedIn(true);
+    setActiveTab('REAL TIME DATA');
   }, []);
 
   useEffect(() => onAuthExpired(clearSessionState), [clearSessionState]);
 
   const handleLoginSuccess = (userEmail: string, role: UserRole, userName: string) => {
+    writePersistedSession({
+      email: userEmail,
+      role,
+      name: userName,
+      loginTime: Date.now(),
+    });
     setIsLoggedIn(true);
     setCurrentUserEmail(userEmail);
     setCurrentUserName(userName);
@@ -503,8 +565,6 @@ export default function App() {
               const updatedDevice = await devicesApi.update(deviceToUpdate.id, patch);
               applyServerDevice(updatedDevice);
             }
-
-            unreachableDevicesRef.current.delete(deviceToUpdate.id);
 
             updated++;
             messages.push(
@@ -974,7 +1034,10 @@ export default function App() {
 
   const pollInFlightRef = useRef(false);
 
-  // SIMPLE SENSOR-ONLY POLLING - NEVER TOUCHES CONTROL FIELDS
+  // SENSOR-ONLY POLLING - NEVER TOUCHES CONTROL FIELDS
+  // Every device is polled every cycle. isOnline is ALWAYS written
+  // explicitly (true or false) so the UI flips to OFFLINE within one
+  // poll cycle without needing a page refresh.
   useEffect(() => {
     if (!isLiveUpdating || !isLoggedIn) return;
     let cancelled = false;
@@ -986,11 +1049,9 @@ export default function App() {
         const currentDevices = devicesRef.current;
         if (currentDevices.length === 0) return;
 
-        // Only poll devices NOT in unreachable list
-        const devicesToPoll = currentDevices.filter(
-          (d) => !unreachableDevicesRef.current.has(d.id)
-        );
-
+        // Poll ALL devices every cycle so offline devices are detected
+        // and online devices can recover automatically.
+        const devicesToPoll = currentDevices;
         if (devicesToPoll.length === 0) return;
 
         const merged = await pollAllDevices(devicesToPoll);
@@ -1009,18 +1070,30 @@ export default function App() {
 
         devicesToPoll.forEach((prevDev) => {
           const fresh = merged.find((m) => m.id === prevDev.id);
-          if (!fresh) return;
 
           const deviceId = prevDev.id;
 
-          if (!fresh.isOnline) {
-            unreachableDevicesRef.current.add(deviceId);
+          // No response at all for this device → it is offline.
+          if (!fresh) {
             patches[deviceId] = {
+              isOnline: false,
               tempReal: null,
-              humidityReal: null
+              humidityReal: null,
+              lastUpdated: new Date().toLocaleTimeString(),
+            };
+            return;
+          }
+
+          if (!fresh.isOnline) {
+            // Responded but unreachable / timed out → offline.
+            patches[deviceId] = {
+              isOnline: false,
+              tempReal: null,
+              humidityReal: null,
+              lastUpdated: new Date().toLocaleTimeString(),
             };
           } else {
-            unreachableDevicesRef.current.delete(deviceId);
+            // Reachable → online, sync telemetry fields.
             patches[deviceId] = {
               isOnline: true,
               tempReal: fresh.tempReal,
