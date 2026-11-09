@@ -3,18 +3,14 @@
  * ---------------------------------------------------------------
  * Direct browser <-> ESP32 communication layer.
  *
- * Two modes, selected by the environment variables you set in your
- * hosting platform (Render/Vercel/Netlify):
- *   - unset          → LAN mode: http://<device-ip-or-hostname>/api/...
- *   - set to a URL   → tunnel mode: <base>/api/... (?key=... appended)
- *
- * This lets one build work both locally (LAN) and online (deployed
- * over HTTPS via esp32-tunnel's SELFHOST relay), with no code change.
+ * Two modes, selected by the VITE_API_URL environment variable:
+ *   - localhost      → LAN mode: http://<device-ip>/api/...
+ *   - deployed URL   → Proxy mode: <Render-URL>/api/esp32/telemetry
  */
 
 import { DeviceData } from '../types';
 
-const REQUEST_TIMEOUT_MS = 2500;
+const REQUEST_TIMEOUT_MS = 5000; // Increased slightly to allow tunnel latency
 
 // NO SIMULATION - real data only
 const SIMULATION_MODE = false;
@@ -22,28 +18,18 @@ const SIMULATION_MODE = false;
 // ------------------------------------------------------------------
 // BASE URL CONFIG
 // ------------------------------------------------------------------
-// Safely read from either CRA (process.env) or Vite (import.meta.env).
-// We use a small hack to avoid TypeScript errors if 'import.meta' isn't available.
-const getEnv = (key: string) => {
-  try {
-    if (typeof process !== 'undefined' && process.env && process.env[`REACT_APP_${key}`]) {
-      return process.env[`REACT_APP_${key}`];
-    }
-    // @ts-ignore
-    if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env[`VITE_${key}`]) {
-      // @ts-ignore
-      return import.meta.env[`VITE_${key}`];
-    }
-  } catch (e) {
-    // ignore
-  }
-  return '';
-};
+const VITE_API_URL = import.meta.env.VITE_API_URL || '';
 
-const RAW_BASE_URL = getEnv('ESP32_BASE_URL').trim().replace(/\/+$/, '');
-const TUNNEL_KEY = getEnv('ESP32_KEY').trim();
+// If running on localhost, we assume LAN mode (talk directly to ESP32).
+// If running on Vercel, VITE_API_URL will be your Render URL (talk to proxy).
+const IS_LOCAL = VITE_API_URL.includes('localhost') || VITE_API_URL === '';
+const RAW_BASE_URL = IS_LOCAL ? '' : VITE_API_URL.replace(/\/+$/, '');
 
-// Returns true when we're talking to the tunnel instead of the LAN.
+// Access key for the tunnel (only needed if your Render backend passes it, 
+// otherwise you can leave this empty as Render handles the secret).
+const TUNNEL_KEY = (import.meta.env.VITE_ESP32_KEY || '').trim();
+
+// Returns true when we're talking to the Render backend instead of the LAN.
 function usingTunnel(): boolean {
   return RAW_BASE_URL.length > 0;
 }
@@ -55,8 +41,6 @@ function withKey(url: string): string {
 }
 
 // Build the URL for a device endpoint.
-//  - Tunnel mode: <base>/api/<path>?key=<key>
-//  - LAN mode:    http://<target>/api/<path>
 function buildUrl(target: string, path: string): string {
   if (usingTunnel()) {
     return withKey(`${RAW_BASE_URL}${path}`);
@@ -114,7 +98,6 @@ function isValidHostname(hostname: string): boolean {
 }
 
 // CRITICAL: This function decides WHERE to connect
-// If hostname is set, ALWAYS use hostname (mDNS) - NEVER use IP
 export function resolveDeviceTarget(device: { ipAddress: string; hostname?: string }): string {
   if (device.hostname && device.hostname.trim()) {
     return normalizeHostname(device.hostname);
@@ -131,16 +114,20 @@ function isValidTarget(target: string): boolean {
 // ------------------------------------------------------------------
 
 export async function fetchDeviceTelemetry(ipAddress: string, device?: DeviceData): Promise<Esp32TelemetryResponse> {
-  // In tunnel mode, the base URL decides the destination.
   const target = device?.hostname ? normalizeHostname(device.hostname) : ipAddress;
 
   if (!usingTunnel() && !isValidTarget(target) && !device) {
     throw new Esp32CommunicationError('Invalid or unconfigured address', ipAddress);
   }
 
+  // --- THE FIX: Choose the path based on mode ---
+  // Locally: hit the ESP32 directly at /api/telemetry
+  // Online: hit the Render proxy at /api/esp32/telemetry
+  const endpointPath = usingTunnel() ? '/api/esp32/telemetry' : '/api/telemetry';
+
   const { signal, cancel } = withTimeout(REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(buildUrl(target, '/api/telemetry'), {
+    const res = await fetch(buildUrl(target, endpointPath), {
       method: 'GET',
       signal,
       mode: 'cors',
@@ -148,7 +135,7 @@ export async function fetchDeviceTelemetry(ipAddress: string, device?: DeviceDat
       headers: TUNNEL_KEY ? { 'X-Tunnel-Key': TUNNEL_KEY } : undefined,
     });
     if (!res.ok) {
-      throw new Esp32CommunicationError(`ESP32 responded with HTTP ${res.status}`, target);
+      throw new Esp32CommunicationError(`Device responded with HTTP ${res.status}`, target);
     }
     const data = (await res.json()) as Esp32TelemetryResponse;
     return data;
@@ -159,7 +146,7 @@ export async function fetchDeviceTelemetry(ipAddress: string, device?: DeviceDat
     if (err instanceof Esp32CommunicationError) throw err;
     throw new Esp32CommunicationError(
       err instanceof DOMException && err.name === 'AbortError'
-        ? 'Timed out waiting for ESP32'
+        ? 'Timed out waiting for device'
         : `Unreachable: ${(err as Error).message}`,
       target
     );
@@ -194,7 +181,7 @@ export async function sendServoCommand(
       },
       body: JSON.stringify({ type, percent }),
     });
-    if (!res.ok) throw new Esp32CommunicationError(`ESP32 rejected servo command (HTTP ${res.status})`, target);
+    if (!res.ok) throw new Esp32CommunicationError(`Device rejected servo command (HTTP ${res.status})`, target);
   } catch (err) {
     if (err instanceof Esp32CommunicationError) throw err;
     throw new Esp32CommunicationError(`Unreachable: ${(err as Error).message}`, target);
@@ -221,7 +208,7 @@ export async function sendAutoAdjustMode(ipAddress: string, enabled: boolean): P
       },
       body: JSON.stringify({ autoAdjust: enabled }),
     });
-    if (!res.ok) throw new Esp32CommunicationError(`ESP32 rejected mode change (HTTP ${res.status})`, target);
+    if (!res.ok) throw new Esp32CommunicationError(`Device rejected mode change (HTTP ${res.status})`, target);
   } catch (err) {
     if (err instanceof Esp32CommunicationError) throw err;
     throw new Esp32CommunicationError(`Unreachable: ${(err as Error).message}`, target);
@@ -252,7 +239,7 @@ export async function sendSetpoints(
       },
       body: JSON.stringify({ targetTemp, targetHum }),
     });
-    if (!res.ok) throw new Esp32CommunicationError(`ESP32 rejected setpoint update (HTTP ${res.status})`, target);
+    if (!res.ok) throw new Esp32CommunicationError(`Device rejected setpoint update (HTTP ${res.status})`, target);
   } catch (err) {
     if (err instanceof Esp32CommunicationError) throw err;
     throw new Esp32CommunicationError(`Unreachable: ${(err as Error).message}`, target);
@@ -283,7 +270,7 @@ export async function sendRelayCommand(
       },
       body: JSON.stringify({ relay, on }),
     });
-    if (!res.ok) throw new Esp32CommunicationError(`ESP32 rejected relay command (HTTP ${res.status})`, target);
+    if (!res.ok) throw new Esp32CommunicationError(`Device rejected relay command (HTTP ${res.status})`, target);
   } catch (err) {
     if (err instanceof Esp32CommunicationError) throw err;
     throw new Esp32CommunicationError(`Unreachable: ${(err as Error).message}`, target);
@@ -305,8 +292,6 @@ export async function pingDevice(ipAddress: string): Promise<{ ok: boolean; late
 // ------------------------------------------------------------------
 // POLLING
 // ------------------------------------------------------------------
-// Returns isOnline:false for rejected devices (instead of the
-// stale previous dev) so App.tsx can flip the UI to offline.
 export async function pollAllDevices(devices: DeviceData[]): Promise<DeviceData[]> {
   const results = await Promise.allSettled(
     devices.map(async (d) => {
@@ -323,7 +308,6 @@ export async function pollAllDevices(devices: DeviceData[]): Promise<DeviceData[
   return devices.map((dev, idx) => {
     const result = results[idx];
     if (result.status === 'rejected') {
-      // Device is unreachable → mark OFFLINE
       return {
         ...dev,
         isOnline: false,
@@ -367,7 +351,6 @@ function addressAtOffset(prefix: string, offset: number): string {
   return `${parts[0]}.${parts[1]}.${thirdOctet}.${lastOctet}`;
 }
 
-// Subnet scanning only makes sense in LAN mode.
 export async function scanSubnetForDevices(
   subnetPrefix: string,
   rangeSize: number = DEFAULT_SCAN_RANGE_SIZE
