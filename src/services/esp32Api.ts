@@ -2,6 +2,14 @@
  * esp32Api.ts
  * ---------------------------------------------------------------
  * Direct browser <-> ESP32 communication layer.
+ *
+ * Two modes, selected by the environment variables you set in your
+ * hosting platform (Render/Vercel/Netlify):
+ *   - unset          → LAN mode: http://<device-ip-or-hostname>/api/...
+ *   - set to a URL   → tunnel mode: <base>/api/... (?key=... appended)
+ *
+ * This lets one build work both locally (LAN) and online (deployed
+ * over HTTPS via esp32-tunnel's SELFHOST relay), with no code change.
  */
 
 import { DeviceData } from '../types';
@@ -10,6 +18,55 @@ const REQUEST_TIMEOUT_MS = 2500;
 
 // NO SIMULATION - real data only
 const SIMULATION_MODE = false;
+
+// ------------------------------------------------------------------
+// BASE URL CONFIG
+// ------------------------------------------------------------------
+// Safely read from either CRA (process.env) or Vite (import.meta.env).
+// We use a small hack to avoid TypeScript errors if 'import.meta' isn't available.
+const getEnv = (key: string) => {
+  try {
+    if (typeof process !== 'undefined' && process.env && process.env[`REACT_APP_${key}`]) {
+      return process.env[`REACT_APP_${key}`];
+    }
+    // @ts-ignore
+    if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env[`VITE_${key}`]) {
+      // @ts-ignore
+      return import.meta.env[`VITE_${key}`];
+    }
+  } catch (e) {
+    // ignore
+  }
+  return '';
+};
+
+const RAW_BASE_URL = getEnv('ESP32_BASE_URL').trim().replace(/\/+$/, '');
+const TUNNEL_KEY = getEnv('ESP32_KEY').trim();
+
+// Returns true when we're talking to the tunnel instead of the LAN.
+function usingTunnel(): boolean {
+  return RAW_BASE_URL.length > 0;
+}
+
+// Append the access key to a URL as ?key=... (only when using the tunnel).
+function withKey(url: string): string {
+  if (!TUNNEL_KEY) return url;
+  return url + (url.includes('?') ? '&' : '?') + `key=${encodeURIComponent(TUNNEL_KEY)}`;
+}
+
+// Build the URL for a device endpoint.
+//  - Tunnel mode: <base>/api/<path>?key=<key>
+//  - LAN mode:    http://<target>/api/<path>
+function buildUrl(target: string, path: string): string {
+  if (usingTunnel()) {
+    return withKey(`${RAW_BASE_URL}${path}`);
+  }
+  return `http://${target}${path}`;
+}
+
+// ------------------------------------------------------------------
+// TYPES
+// ------------------------------------------------------------------
 
 export interface Esp32TelemetryResponse {
   ip: string;
@@ -59,11 +116,9 @@ function isValidHostname(hostname: string): boolean {
 // CRITICAL: This function decides WHERE to connect
 // If hostname is set, ALWAYS use hostname (mDNS) - NEVER use IP
 export function resolveDeviceTarget(device: { ipAddress: string; hostname?: string }): string {
-  // ALWAYS use hostname if set - it's more reliable
   if (device.hostname && device.hostname.trim()) {
     return normalizeHostname(device.hostname);
   }
-  // Only use IP if NO hostname is set
   return device.ipAddress;
 }
 
@@ -71,21 +126,26 @@ function isValidTarget(target: string): boolean {
   return isValidIp(target) || isValidHostname(target) || /\.local$/i.test(target?.trim() || '');
 }
 
+// ------------------------------------------------------------------
+// TELEMETRY
+// ------------------------------------------------------------------
+
 export async function fetchDeviceTelemetry(ipAddress: string, device?: DeviceData): Promise<Esp32TelemetryResponse> {
-  // If device has hostname, use hostname (mDNS) - ignore IP
+  // In tunnel mode, the base URL decides the destination.
   const target = device?.hostname ? normalizeHostname(device.hostname) : ipAddress;
-  
-  if (!isValidTarget(target) && !device) {
+
+  if (!usingTunnel() && !isValidTarget(target) && !device) {
     throw new Esp32CommunicationError('Invalid or unconfigured address', ipAddress);
   }
 
   const { signal, cancel } = withTimeout(REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(`http://${target}/api/telemetry`, {
+    const res = await fetch(buildUrl(target, '/api/telemetry'), {
       method: 'GET',
       signal,
       mode: 'cors',
       cache: 'no-store',
+      headers: TUNNEL_KEY ? { 'X-Tunnel-Key': TUNNEL_KEY } : undefined,
     });
     if (!res.ok) {
       throw new Esp32CommunicationError(`ESP32 responded with HTTP ${res.status}`, target);
@@ -93,9 +153,8 @@ export async function fetchDeviceTelemetry(ipAddress: string, device?: DeviceDat
     const data = (await res.json()) as Esp32TelemetryResponse;
     return data;
   } catch (err) {
-    // Only log if it's NOT a timeout (timeouts are expected when device is off)
     if (!(err instanceof DOMException && err.name === 'AbortError')) {
-      console.warn(`[ESP32] Could not reach ${target}:`, err instanceof Error ? err.message : err);
+      console.warn(`[ESP32] Could not reach ${usingTunnel() ? RAW_BASE_URL : target}:`, err instanceof Error ? err.message : err);
     }
     if (err instanceof Esp32CommunicationError) throw err;
     throw new Esp32CommunicationError(
@@ -109,22 +168,30 @@ export async function fetchDeviceTelemetry(ipAddress: string, device?: DeviceDat
   }
 }
 
+// ------------------------------------------------------------------
+// COMMANDS
+// ------------------------------------------------------------------
+
 export async function sendServoCommand(
   ipAddress: string,
   type: 'hot' | 'cold',
   percent: 0 | 25 | 50 | 75 | 100
 ): Promise<void> {
-  // Use hostname if available, otherwise IP
   const target = ipAddress;
-  if (!isValidTarget(target)) throw new Esp32CommunicationError('Invalid or unconfigured address', target);
+  if (!usingTunnel() && !isValidTarget(target)) {
+    throw new Esp32CommunicationError('Invalid or unconfigured address', target);
+  }
 
   const { signal, cancel } = withTimeout(REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(`http://${target}/api/servo`, {
+    const res = await fetch(buildUrl(target, '/api/servo'), {
       method: 'POST',
       signal,
       mode: 'cors',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(TUNNEL_KEY ? { 'X-Tunnel-Key': TUNNEL_KEY } : {}),
+      },
       body: JSON.stringify({ type, percent }),
     });
     if (!res.ok) throw new Esp32CommunicationError(`ESP32 rejected servo command (HTTP ${res.status})`, target);
@@ -138,15 +205,20 @@ export async function sendServoCommand(
 
 export async function sendAutoAdjustMode(ipAddress: string, enabled: boolean): Promise<void> {
   const target = ipAddress;
-  if (!isValidTarget(target)) throw new Esp32CommunicationError('Invalid or unconfigured address', target);
+  if (!usingTunnel() && !isValidTarget(target)) {
+    throw new Esp32CommunicationError('Invalid or unconfigured address', target);
+  }
 
   const { signal, cancel } = withTimeout(REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(`http://${target}/api/mode`, {
+    const res = await fetch(buildUrl(target, '/api/mode'), {
       method: 'POST',
       signal,
       mode: 'cors',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(TUNNEL_KEY ? { 'X-Tunnel-Key': TUNNEL_KEY } : {}),
+      },
       body: JSON.stringify({ autoAdjust: enabled }),
     });
     if (!res.ok) throw new Esp32CommunicationError(`ESP32 rejected mode change (HTTP ${res.status})`, target);
@@ -164,15 +236,20 @@ export async function sendSetpoints(
   targetHum?: number
 ): Promise<void> {
   const target = ipAddress;
-  if (!isValidTarget(target)) throw new Esp32CommunicationError('Invalid or unconfigured address', target);
+  if (!usingTunnel() && !isValidTarget(target)) {
+    throw new Esp32CommunicationError('Invalid or unconfigured address', target);
+  }
 
   const { signal, cancel } = withTimeout(REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(`http://${target}/api/setpoint`, {
+    const res = await fetch(buildUrl(target, '/api/setpoint'), {
       method: 'POST',
       signal,
       mode: 'cors',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(TUNNEL_KEY ? { 'X-Tunnel-Key': TUNNEL_KEY } : {}),
+      },
       body: JSON.stringify({ targetTemp, targetHum }),
     });
     if (!res.ok) throw new Esp32CommunicationError(`ESP32 rejected setpoint update (HTTP ${res.status})`, target);
@@ -190,15 +267,20 @@ export async function sendRelayCommand(
   on: boolean
 ): Promise<void> {
   const target = ipAddress;
-  if (!isValidTarget(target)) throw new Esp32CommunicationError('Invalid or unconfigured address', target);
+  if (!usingTunnel() && !isValidTarget(target)) {
+    throw new Esp32CommunicationError('Invalid or unconfigured address', target);
+  }
 
   const { signal, cancel } = withTimeout(REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(`http://${target}/api/relay`, {
+    const res = await fetch(buildUrl(target, '/api/relay'), {
       method: 'POST',
       signal,
       mode: 'cors',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(TUNNEL_KEY ? { 'X-Tunnel-Key': TUNNEL_KEY } : {}),
+      },
       body: JSON.stringify({ relay, on }),
     });
     if (!res.ok) throw new Esp32CommunicationError(`ESP32 rejected relay command (HTTP ${res.status})`, target);
@@ -220,18 +302,19 @@ export async function pingDevice(ipAddress: string): Promise<{ ok: boolean; late
   }
 }
 
-// CRITICAL: This function ONLY returns sensor data, NEVER control fields
-// Control fields (valves, relays, auto-adjust) are user-controlled
+// ------------------------------------------------------------------
+// POLLING
+// ------------------------------------------------------------------
+// Returns isOnline:false for rejected devices (instead of the
+// stale previous dev) so App.tsx can flip the UI to offline.
 export async function pollAllDevices(devices: DeviceData[]): Promise<DeviceData[]> {
   const results = await Promise.allSettled(
     devices.map(async (d) => {
-      // Use hostname if set, otherwise IP
       const target = d.hostname ? normalizeHostname(d.hostname) : d.ipAddress;
       try {
         return await fetchDeviceTelemetry(target, d);
       } catch (err) {
-        // Silently ignore unreachable devices - don't throw
-        console.log(`[ESP32] Device ${d.id} unreachable at ${target}`);
+        console.log(`[ESP32] Device ${d.id} unreachable at ${usingTunnel() ? RAW_BASE_URL : target}`);
         throw err;
       }
     })
@@ -240,14 +323,18 @@ export async function pollAllDevices(devices: DeviceData[]): Promise<DeviceData[
   return devices.map((dev, idx) => {
     const result = results[idx];
     if (result.status === 'rejected') {
-      // Device is unreachable - keep it as-is, DON'T mark as offline
-      // Don't change any control fields
-      return dev;
+      // Device is unreachable → mark OFFLINE
+      return {
+        ...dev,
+        isOnline: false,
+        tempReal: null,
+        humidityReal: null,
+        lastUpdated: new Date().toLocaleTimeString(),
+      } as DeviceData;
     }
 
     const t = result.value;
-    
-    // CRITICAL: ONLY return sensor data, NEVER control fields
+
     return {
       ...dev,
       isOnline: true,
@@ -256,19 +343,13 @@ export async function pollAllDevices(devices: DeviceData[]): Promise<DeviceData[
       macAddress: t.mac || dev.macAddress,
       firmwareVersion: t.firmwareVersion || dev.firmwareVersion,
       lastUpdated: new Date().toLocaleTimeString(),
-      // DO NOT update these from polling:
-      // hotValvePercent: dev.hotValvePercent,
-      // coldValvePercent: dev.coldValvePercent,
-      // hotValveAngle: dev.hotValveAngle,
-      // coldValveAngle: dev.coldValveAngle,
-      // autoAdjustEnabled: dev.autoAdjustEnabled,
-      // ahuPowerOn: dev.ahuPowerOn,
-      // dhu1On: dev.dhu1On,
-      // dhu2On: dev.dhu2On,
     } as DeviceData;
   });
 }
 
+// ------------------------------------------------------------------
+// SUBNET SCAN
+// ------------------------------------------------------------------
 const SCAN_TIMEOUT_MS = 500;
 const DEFAULT_SCAN_RANGE_SIZE = 510;
 const SCAN_BATCH_SIZE = 128;
@@ -286,10 +367,16 @@ function addressAtOffset(prefix: string, offset: number): string {
   return `${parts[0]}.${parts[1]}.${thirdOctet}.${lastOctet}`;
 }
 
+// Subnet scanning only makes sense in LAN mode.
 export async function scanSubnetForDevices(
   subnetPrefix: string,
   rangeSize: number = DEFAULT_SCAN_RANGE_SIZE
 ): Promise<ScannedDevice[]> {
+  if (usingTunnel()) {
+    console.warn('[SCAN] Subnet scan skipped: tunnel mode is single-endpoint.');
+    return [];
+  }
+
   const prefix = subnetPrefix.trim().replace(/\.$/, '');
   if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(prefix)) {
     throw new Error('Subnet prefix must look like "192.168.137" (first 3 octets only)');
