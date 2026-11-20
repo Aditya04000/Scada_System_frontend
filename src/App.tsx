@@ -8,7 +8,6 @@ import {
   sendServoCommand, 
   sendAutoAdjustMode, 
   sendRelayCommand,
-  scanSubnetForDevices,
   resolveDeviceTarget
 } from './services/esp32Api';
 

@@ -1,6 +1,7 @@
 import { DeviceData } from '../types';
 
-const API_URL = import.meta.env.VITE_API_URL || 'https://scada-system-backend.onrender.com';
+// Hardcoded to guarantee Vercel connects to the right backend
+const API_URL = "https://scada-system-backend.onrender.com";
 
 // ---------------------------------------------------------
 // TYPES
@@ -32,15 +33,22 @@ export class Esp32CommunicationError extends Error {
 export async function fetchDeviceTelemetry(ipAddress: string, device?: DeviceData): Promise<Esp32TelemetryResponse> {
   if (!device?.id) throw new Esp32CommunicationError('No device ID provided', ipAddress);
 
+  console.log(`[Fetch] Requesting telemetry for EXACT ID: "${device.id}"`);
+  
   // Query Render directly
   const res = await fetch(`${API_URL}/api/device-sync/telemetry?deviceId=${encodeURIComponent(device.id)}`);
   
-  if (!res.ok) throw new Esp32CommunicationError('HTTP Error', ipAddress);
+  if (!res.ok) {
+    console.error(`[Fetch] HTTP Error: ${res.status}`);
+    throw new Esp32CommunicationError('HTTP Error', ipAddress);
+  }
   
   const data = await res.json();
+  console.log(`[Fetch] Raw response from Render:`, data);
   
   // If Render has no data (empty object), the ESP32 is offline
   if (!data || !data.receivedAt) {
+    console.warn(`[Fetch] Device is OFFLINE. Render has no data for "${device.id}"`);
     throw new Esp32CommunicationError('Device offline in cloud', ipAddress);
   }
 
@@ -96,6 +104,7 @@ export async function pollAllDevices(devices: DeviceData[]): Promise<DeviceData[
 // ---------------------------------------------------------
 export async function sendServoCommand(ipAddress: string, type: 'hot' | 'cold', percent: number, deviceId?: string): Promise<void> {
   if (!deviceId) return;
+  console.log(`[Command] Sending Servo command to Render for ${deviceId}`);
   const commandKey = type === 'hot' ? 'hotPercent' : 'coldPercent';
   await fetch(`${API_URL}/api/device-sync/state`, {
     method: 'POST',
@@ -106,6 +115,7 @@ export async function sendServoCommand(ipAddress: string, type: 'hot' | 'cold', 
 
 export async function sendRelayCommand(ipAddress: string, relay: 'AHU' | 'DHU1' | 'DHU2', on: boolean, deviceId?: string): Promise<void> {
   if (!deviceId) return;
+  console.log(`[Command] Sending Relay command to Render for ${deviceId}: ${relay} -> ${on}`);
   const relayKey = relay.toLowerCase();
   await fetch(`${API_URL}/api/device-sync/state`, {
     method: 'POST',
@@ -116,6 +126,7 @@ export async function sendRelayCommand(ipAddress: string, relay: 'AHU' | 'DHU1' 
 
 export async function sendAutoAdjustMode(ipAddress: string, enabled: boolean, deviceId?: string): Promise<void> {
   if (!deviceId) return;
+  console.log(`[Command] Sending AutoMode command to Render for ${deviceId}`);
   await fetch(`${API_URL}/api/device-sync/state`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -128,7 +139,7 @@ export async function pingDevice(ipAddress: string): Promise<{ ok: boolean; late
 }
 
 // ---------------------------------------------------------
-// FALLBACKS (To prevent TS errors in App.tsx)
+// DUMMY EXPORTS (To prevent TS errors in App.tsx)
 // ---------------------------------------------------------
 export function resolveDeviceTarget(device: { ipAddress: string; hostname?: string }): string {
   return device.ipAddress; 
