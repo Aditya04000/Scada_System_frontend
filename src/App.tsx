@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { NavTab, DeviceData, AlarmLog, AutomationLog, AutomationRule, UserRole, AuditLogEntry, HistoryDataPoint } from './types';
 import { MAX_DEVICES } from './data/initialData';
 import { signOut } from './data/userCredentials';
+
 import { 
   pollAllDevices, 
   sendServoCommand, 
@@ -10,6 +11,7 @@ import {
   scanSubnetForDevices,
   resolveDeviceTarget
 } from './services/esp32Api';
+
 import {
   alarmsApi,
   auditApi,
@@ -18,7 +20,6 @@ import {
   settingsApi,
   errorMessage,
   fireAndForget,
-  isApiError,
   onAuthExpired,
   type AutomationLogInput,
   type DevicePatch,
@@ -40,16 +41,7 @@ import { ServoVisualizerModal } from './components/ServoVisualizerModal';
 
 const HISTORY_RETENTION_MS = 24 * 60 * 60 * 1000;
 const HISTORY_SAMPLE_INTERVAL_MS = 5 * 60 * 1000;  
-const HISTORY_WINDOW_HOURS = 24;
 const TELEMETRY_POLL_INTERVAL_MS = 4000; 
-
-const AUDIT_PAGE_SIZE = 2000;
-const AUTOMATION_LOG_LIMIT = 200;
-
-const DEFAULT_SCAN_SUBNET = '192.168.137';
-const SUBNET_SAVE_DEBOUNCE_MS = 600;
-const LOAD_RETRY_MS = 15000;
-
 const ALARM_PERSIST_DELAY_MS = 60_000;
 
 const SESSION_STORAGE_KEY = 'ctrl_hvac_session';
@@ -58,12 +50,7 @@ const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 type ThresholdKey = 'tempHigh' | 'tempLow' | 'humHigh' | 'humLow';
 const THRESHOLD_KEYS: ThresholdKey[] = ['tempHigh', 'tempLow', 'humHigh', 'humLow'];
 
-type PersistedSession = {
-  email: string;
-  role: UserRole;
-  name: string;
-  loginTime: number;
-};
+type PersistedSession = { email: string; role: UserRole; name: string; loginTime: number; };
 
 function readPersistedSession(): PersistedSession | null {
   try {
@@ -72,76 +59,26 @@ function readPersistedSession(): PersistedSession | null {
     const parsed = JSON.parse(raw) as Partial<PersistedSession>;
     if (!parsed?.email || !parsed?.loginTime) return null;
     if (Date.now() - parsed.loginTime > SESSION_MAX_AGE_MS) return null;
-    return {
-      email: parsed.email,
-      role: (parsed.role as UserRole) || 'OPERATOR',
-      name: parsed.name || parsed.email,
-      loginTime: parsed.loginTime,
-    };
-  } catch {
-    return null;
-  }
+    return { email: parsed.email, role: (parsed.role as UserRole) || 'OPERATOR', name: parsed.name || parsed.email, loginTime: parsed.loginTime };
+  } catch { return null; }
 }
 
 function writePersistedSession(session: PersistedSession) {
-  try {
-    sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
-  } catch {}
+  try { sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session)); } catch {}
 }
 
 function clearPersistedSession() {
-  try {
-    sessionStorage.removeItem(SESSION_STORAGE_KEY);
-  } catch {}
-}
-
-function isSavableSubnet(value: string): boolean {
-  const raw = value.trim().replace(/\.$/, '');
-  if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(raw)) return false;
-  return raw.split('.').every((octet) => Number(octet) >= 0 && Number(octet) <= 255);
-}
-
-function normalizeSubnet(value: string): string {
-  return value.trim().replace(/\.$/, '');
-}
-
-function mergeServerDevice(fresh: DeviceData, local: DeviceData | undefined): DeviceData {
-  if (!local) return fresh;
-  return {
-    ...fresh,
-    tempReal: local.tempReal,
-    humidityReal: local.humidityReal,
-    isOnline: local.isOnline,
-    lastUpdated: local.lastUpdated,
-  };
+  try { sessionStorage.removeItem(SESSION_STORAGE_KEY); } catch {}
 }
 
 function mergeFleet(previous: DeviceData[], fresh: DeviceData[]): DeviceData[] {
   if (previous.length === 0) return fresh;
   const byId = new Map(previous.map((d) => [d.id, d]));
-  return fresh.map((d) => mergeServerDevice(d, byId.get(d.id)));
-}
-
-function mergeAlarms(previous: AlarmLog[], incoming: AlarmLog[]): AlarmLog[] {
-  if (incoming.length === 0) return previous;
-  const byId = new Map(incoming.map((a) => [a.id, a]));
-  const replaced = previous.map((a) => byId.get(a.id) ?? a);
-  for (const a of previous) byId.delete(a.id);
-  const additions = incoming.filter((a) => byId.has(a.id));
-  return additions.length > 0 ? [...additions, ...replaced] : replaced;
-}
-
-function groupHistory(points: HistoryDataPoint[]): Record<string, HistoryDataPoint[]> {
-  const grouped: Record<string, HistoryDataPoint[]> = {};
-  for (const point of points) {
-    const bucket = grouped[point.device];
-    if (bucket) bucket.push(point);
-    else grouped[point.device] = [point];
-  }
-  for (const key of Object.keys(grouped)) {
-    grouped[key]!.sort((a, b) => a.timestamp - b.timestamp);
-  }
-  return grouped;
+  return fresh.map((d) => {
+    const local = byId.get(d.id);
+    if (!local) return d;
+    return { ...d, tempReal: local.tempReal, humidityReal: local.humidityReal, isOnline: local.isOnline };
+  });
 }
 
 export default function App() {
@@ -152,609 +89,55 @@ export default function App() {
   const [currentUserRole, setCurrentUserRole] = useState<UserRole>('OPERATOR');
 
   const [devices, setDevices] = useState<DeviceData[]>([]);
-  const [isFleetLoaded, setIsFleetLoaded] = useState<boolean>(false);
   const [alarms, setAlarms] = useState<AlarmLog[]>([]);
-  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
   const [deviceHistory, setDeviceHistory] = useState<Record<string, HistoryDataPoint[]>>({});
-  const [automationLogs, setAutomationLogs] = useState<AutomationLog[]>([]);
   const [automationRules, setAutomationRules] = useState<AutomationRule[]>([]);
-  const [scanSubnet, setScanSubnet] = useState<string>(DEFAULT_SCAN_SUBNET);
-  const [autoScanEnabled, setAutoScanEnabled] = useState<boolean>(true);
-
-  const lastHistorySampleRef = useRef<Record<string, number>>({});
 
   const [isLiveUpdating, setIsLiveUpdating] = useState<boolean>(true);
   const [selectedServoDevice, setSelectedServoDevice] = useState<DeviceData | null>(null);
 
-  const breachStartRef = useRef<Record<string, Record<ThresholdKey, number>>>({});
-  const pendingPersistTimersRef = useRef<Record<string, Record<ThresholdKey, number | null>>>({});
-
   const devicesRef = useRef<DeviceData[]>(devices);
-  useEffect(() => {
-    devicesRef.current = devices;
-  }, [devices]);
+  useEffect(() => { devicesRef.current = devices; }, [devices]);
 
-  const scanSubnetRef = useRef<string>(scanSubnet);
-  useEffect(() => {
-    scanSubnetRef.current = scanSubnet;
-  }, [scanSubnet]);
-
-  const refreshDevices = useCallback(async () => {
+  const loadAll = useCallback(async () => {
     try {
       const fleet = await devicesApi.list();
-      setDevices((prev) => mergeFleet(prev, fleet));
-      setIsFleetLoaded(true);
-    } catch (err) {
-      console.error('[API] Could not refresh the device list:', errorMessage(err));
-    }
-  }, []);
-
-  const refreshAlarms = useCallback(async () => {
-    try {
+      setDevices(fleet);
+      const rules = await rulesApi.list();
+      setAutomationRules(rules);
       const { alarms: list } = await alarmsApi.list();
       setAlarms(list);
     } catch (err) {
-      console.error('[API] Could not refresh the alarm list:', errorMessage(err));
+      console.error('Failed to load initial data', err);
     }
   }, []);
-
-  const refreshAuditLog = useCallback(async () => {
-    try {
-      const { entries } = await auditApi.list({ limit: AUDIT_PAGE_SIZE });
-      setAuditLogs(entries);
-    } catch (err) {
-      console.error('[API] Could not refresh the audit log:', errorMessage(err));
-    }
-  }, []);
-
-  const refreshRules = useCallback(async () => {
-    try {
-      setAutomationRules(await rulesApi.list());
-    } catch (err) {
-      console.error('[API] Could not refresh the automation rules:', errorMessage(err));
-    }
-  }, []);
-
-  const loadAll = useCallback(async (): Promise<boolean> => {
-    const skipAuditLog = currentUserRole === 'OPERATOR';
-
-    const [fleetRes, alarmRes, auditRes, ruleRes, automationRes, historyRes, settingsRes] = await Promise.allSettled([
-      devicesApi.list(),
-      alarmsApi.list(),
-      skipAuditLog ? Promise.resolve({ entries: [], total: 0 }) : auditApi.list({ limit: AUDIT_PAGE_SIZE }),
-      rulesApi.list(),
-      rulesApi.log({ limit: AUTOMATION_LOG_LIMIT }),
-      devicesApi.history({ hours: HISTORY_WINDOW_HOURS }),
-      settingsApi.get(),
-    ]);
-
-    let everythingLoaded = true;
-    const note = (what: string, reason: unknown) => {
-      everythingLoaded = false;
-      console.error(`[API] Could not load ${what}:`, errorMessage(reason));
-    };
-
-    if (fleetRes.status === 'fulfilled') {
-      const fleet = fleetRes.value;
-      setDevices((prev) => mergeFleet(prev, fleet));
-      setIsFleetLoaded(true);
-
-      const now = Date.now();
-      const initialHistory: Record<string, HistoryDataPoint[]> = {};
-
-      fleet.forEach((device) => {
-        if (device.tempReal !== null && device.humidityReal !== null) {
-          initialHistory[device.id] = [
-            {
-              time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-              timestamp: now,
-              device: device.id,
-              temperature: device.tempReal,
-              humidity: device.humidityReal,
-              hotServoAngle: device.hotValveAngle,
-              coldServoAngle: device.coldValveAngle,
-            },
-          ];
-        }
-      });
-
-      setDeviceHistory((prev) => ({ ...prev, ...initialHistory }));
-    } else note('the device list', fleetRes.reason);
-
-    if (alarmRes.status === 'fulfilled') setAlarms(alarmRes.value.alarms);
-    if (auditRes.status === 'fulfilled') setAuditLogs(auditRes.value.entries);
-    if (ruleRes.status === 'fulfilled') setAutomationRules(ruleRes.value);
-    if (automationRes.status === 'fulfilled') setAutomationLogs(automationRes.value);
-
-    if (historyRes.status === 'fulfilled') {
-      const history = groupHistory(historyRes.value);
-      setDeviceHistory((prev) => ({ ...prev, ...history }));
-    }
-
-    if (settingsRes.status === 'fulfilled') {
-      setScanSubnet(settingsRes.value.scanSubnet);
-      scanSubnetRef.current = settingsRes.value.scanSubnet;
-      setAutoScanEnabled(settingsRes.value.autoScanEnabled);
-    }
-
-    return everythingLoaded;
-  }, [currentUserRole]);
 
   useEffect(() => {
     if (!isLoggedIn) return;
-    let cancelled = false;
-    let timer: number | null = null;
-
-    const attempt = async () => {
-      const loaded = await loadAll();
-      if (cancelled || loaded) return;
-      timer = window.setTimeout(() => { void attempt(); }, LOAD_RETRY_MS);
-    };
-
-    void attempt();
-
-    return () => {
-      cancelled = true;
-      if (timer !== null) window.clearTimeout(timer);
-    };
+    void loadAll();
   }, [isLoggedIn, loadAll]);
 
   useEffect(() => {
-    if (!isLoggedIn || activeTab !== 'AUDIT LOG') return;
-    if (currentUserRole === 'OPERATOR') return;
-    void refreshAuditLog();
-  }, [isLoggedIn, activeTab, refreshAuditLog, currentUserRole]);
-
-  const clearSessionState = useCallback(() => {
-    clearPersistedSession();
-    setIsLoggedIn(false);
-    setCurrentUserEmail('');
-    setCurrentUserName('');
-    setCurrentUserRole('OPERATOR');
-    setActiveTab('LOGIN');
-    setDevices([]);
-    setIsFleetLoaded(false);
-    setAlarms([]);
-    setAuditLogs([]);
-    setAutomationLogs([]);
-    setAutomationRules([]);
-    setDeviceHistory({});
-    setSelectedServoDevice(null);
-    openBreachesRef.current = {};
-    lastHistorySampleRef.current = {};
-    didInitialScanRef.current = false;
-
-    for (const deviceMap of Object.values(pendingPersistTimersRef.current)) {
-      for (const timer of Object.values(deviceMap)) {
-        if (timer !== null && timer !== undefined) window.clearTimeout(timer);
-      }
-    }
-    pendingPersistTimersRef.current = {};
-    breachStartRef.current = {};
-  }, []);
-
-  useEffect(() => {
     const persisted = readPersistedSession();
-    if (!persisted) {
-      setIsLoggedIn(false);
-      setActiveTab('LOGIN');
-      return;
-    }
-    setCurrentUserEmail(persisted.email);
-    setCurrentUserName(persisted.name);
-    setCurrentUserRole(persisted.role);
-    setIsLoggedIn(true);
-    setActiveTab('REAL TIME DATA');
+    if (!persisted) { setIsLoggedIn(false); setActiveTab('LOGIN'); return; }
+    setCurrentUserEmail(persisted.email); setCurrentUserName(persisted.name);
+    setCurrentUserRole(persisted.role); setIsLoggedIn(true); setActiveTab('REAL TIME DATA');
   }, []);
 
-  useEffect(() => onAuthExpired(clearSessionState), [clearSessionState]);
-
-  const handleLoginSuccess = (userEmail: string, role: UserRole, userName: string) => {
-    writePersistedSession({ email: userEmail, role, name: userName, loginTime: Date.now() });
-    setIsLoggedIn(true);
-    setCurrentUserEmail(userEmail);
-    setCurrentUserName(userName);
-    setCurrentUserRole(role);
-    setActiveTab('REAL TIME DATA');
+  const handleLoginSuccess = (email: string, role: UserRole, name: string) => {
+    writePersistedSession({ email, role, name, loginTime: Date.now() });
+    setIsLoggedIn(true); setCurrentUserEmail(email); setCurrentUserName(name);
+    setCurrentUserRole(role); setActiveTab('REAL TIME DATA');
   };
 
   const handleLogout = () => {
     fireAndForget(signOut(), 'sign out');
-    clearSessionState();
+    clearPersistedSession(); setIsLoggedIn(false); setActiveTab('LOGIN'); setDevices([]);
   };
 
-  const applyServerDevice = useCallback((fresh: DeviceData) => {
-    setDevices((prev) => {
-      const index = prev.findIndex((d) => d.id === fresh.id);
-      if (index === -1) return [...prev, fresh];
-      const next = [...prev];
-      next[index] = mergeServerDevice(fresh, prev[index]);
-      return next;
-    });
-  }, []);
-
-  const persistDevice = useCallback((deviceId: string, patch: DevicePatch, what: string) => {
-    void (async () => {
-      try {
-        await devicesApi.update(deviceId, patch);
-      } catch (err) {
-        console.error(`[API] ${what} for ${deviceId} was not saved: ${errorMessage(err)}`);
-      }
-    })();
-  }, []);
-
-  const handleUpdateDeviceName = (deviceId: string, newName: string) => {
-    setDevices((prev) => prev.map((d) => (d.id === deviceId ? { ...d, name: newName } : d)));
-    persistDevice(deviceId, { name: newName }, 'Device name');
-  };
-
-  const handleUpdateDeviceRoom = (deviceId: string, newRoomName: string) => {
-    setDevices((prev) => prev.map((d) => (d.id === deviceId ? { ...d, roomName: newRoomName } : d)));
-    persistDevice(deviceId, { roomName: newRoomName }, 'Room name');
-  };
-
-  const handleUpdateDeviceIp = (deviceId: string, newIp: string) => {
-    setDevices((prev) => prev.map((d) => (d.id === deviceId ? { ...d, ipAddress: newIp } : d)));
-    persistDevice(deviceId, { ipAddress: newIp.trim() || null }, 'IP address');
-  };
-
-  const handleUpdateDeviceHostname = (deviceId: string, newHostname: string) => {
-    const trimmed = newHostname.trim().replace(/\.local$/, '');
-    setDevices((prev) => prev.map((d) => (d.id === deviceId ? { ...d, hostname: trimmed || undefined } : d)));
-    persistDevice(deviceId, { hostname: trimmed || null }, 'Hostname');
-  };
-
-  const handleAddDevice = (name: string, roomName: string) => {
-    if (currentUserRole !== 'ADMIN' || devices.length >= MAX_DEVICES) return;
-    void (async () => {
-      try {
-        const created = await devicesApi.create({ name: name.trim() || undefined, roomName: roomName.trim() || 'Unassigned Room' });
-        applyServerDevice(created);
-      } catch (err) {
-        console.error('[API] Could not add a device:', errorMessage(err));
-      }
-    })();
-  };
-
-  const handleRemoveDevice = (deviceId: string) => {
-    if (currentUserRole !== 'ADMIN') return;
-    setDevices((prev) => prev.filter((d) => d.id !== deviceId));
-    void (async () => {
-      try {
-        await devicesApi.remove(deviceId);
-      } catch (err) {
-        console.error(`[API] Could not remove ${deviceId}:`, errorMessage(err));
-      }
-    })();
-  };
-
-  const [lastScanResult, setLastScanResult] = useState<{
-    found: number; assigned: number; updated: number; messages: string[]; timestamp: string; automatic: boolean;
-  } | null>(null);
-  const isScanningRef = useRef(false);
-  const didInitialScanRef = useRef(false);
-
-  const handleScanNetwork = useCallback(
-    async (subnetPrefix: string, automatic = false): Promise<{ found: number; assigned: number; updated: number; messages: string[] }> => {
-      let found = [];
-      try {
-        found = await scanSubnetForDevices(subnetPrefix);
-      } catch (err) {
-        console.error('[SCAN] Error scanning subnet:', err);
-        const result = { found: 0, assigned: 0, updated: 0, messages: ['Scan failed. Are you on the local Wi-Fi?'] };
-        setLastScanResult({ ...result, timestamp: new Date().toLocaleTimeString(), automatic });
-        return result;
-      }
-
-      const messages: string[] = [];
-      let assigned = 0;
-      let updated = 0;
-
-      for (const scanned of found) {
-        const mac = (scanned.telemetry.mac || '').toUpperCase();
-        const reportedHostname = scanned.telemetry.hostname && scanned.telemetry.hostname.trim();
-
-        if (!mac && !reportedHostname) continue;
-
-        try {
-          let deviceToUpdate = null;
-
-          if (reportedHostname) {
-            const hostnameMatch = devicesRef.current.find(
-              (d) => d.hostname?.toLowerCase().replace(/\.local$/, '') === reportedHostname.toLowerCase().replace(/\.local$/, '')
-            );
-            if (hostnameMatch) deviceToUpdate = hostnameMatch;
-          }
-
-          if (!deviceToUpdate && mac) {
-            const macMatch = devicesRef.current.find((d) => d.macAddress?.toUpperCase() === mac);
-            if (macMatch) deviceToUpdate = macMatch;
-          }
-
-          if (deviceToUpdate) {
-            const patch: DevicePatch = {};
-            if (!deviceToUpdate.hostname) patch.ipAddress = scanned.ip;
-            if (scanned.telemetry.firmwareVersion) patch.firmwareVersion = scanned.telemetry.firmwareVersion;
-
-            if (Object.keys(patch).length > 0) {
-              const updatedDevice = await devicesApi.update(deviceToUpdate.id, patch);
-              applyServerDevice(updatedDevice);
-            }
-            updated++;
-            messages.push(`${deviceToUpdate.id}: connected locally at ${reportedHostname ? reportedHostname + '.local' : scanned.ip}`);
-          } else {
-            const { device, claimed } = await devicesApi.bind({
-              macAddress: mac, ipAddress: scanned.ip, hostname: reportedHostname || null,
-              firmwareVersion: scanned.telemetry.firmwareVersion ?? null, pingMs: null,
-            });
-            applyServerDevice(device);
-            if (claimed) { assigned++; messages.push(`New device ${device.id} found at ${scanned.ip}`); }
-            else { updated++; messages.push(`${device.id}: IP refreshed to ${scanned.ip}`); }
-          }
-        } catch (err) {
-          messages.push(`${scanned.ip} could not be saved: ${errorMessage(err)}`);
-        }
-      }
-
-      const result = { found: found.length, assigned, updated, messages };
-      setLastScanResult({ ...result, timestamp: new Date().toLocaleTimeString(), automatic });
-      return result;
-    },
-    [applyServerDevice]
-  );
-
-  const subnetSaveTimerRef = useRef<number | null>(null);
-
-  const handleScanSubnetChange = useCallback((value: string) => {
-    setScanSubnet(value);
-    scanSubnetRef.current = value;
-    if (subnetSaveTimerRef.current !== null) window.clearTimeout(subnetSaveTimerRef.current);
-    if (!isSavableSubnet(value)) return;
-    const normalized = normalizeSubnet(value);
-    subnetSaveTimerRef.current = window.setTimeout(() => {
-      subnetSaveTimerRef.current = null;
-      fireAndForget(settingsApi.update({ scanSubnet: normalized }), 'save discovery subnet');
-    }, SUBNET_SAVE_DEBOUNCE_MS);
-  }, []);
-
-  useEffect(() => () => {
-    if (subnetSaveTimerRef.current !== null) window.clearTimeout(subnetSaveTimerRef.current);
-  }, []);
-
-  const handleToggleDeviceOnline = (deviceId: string) => {
-    setDevices((prev) => prev.map((d) => {
-      if (d.id === deviceId) {
-        return { ...d, isOnline: !d.isOnline, tempReal: !d.isOnline ? 24.5 : null, humidityReal: !d.isOnline ? 50.0 : null };
-      }
-      return d;
-    }));
-  };
-
-  const handleUpdateDeviceThresholds = (deviceId: string, field: 'tempMax' | 'tempMin' | 'humidityMax' | 'humidityMin', value: number) => {
-    const rounded = Number(value.toFixed(1));
-    setDevices((prev) => prev.map((d) => (d.id === deviceId ? { ...d, [field]: rounded } : d)));
-    persistDevice(deviceId, { [field]: rounded }, 'Threshold');
-  };
-
-  const handleToggleAutoAdjust = (deviceId: string, enabled: boolean) => {
-    setDevices((prev) => prev.map((d) => (d.id === deviceId ? { ...d, autoAdjustEnabled: enabled } : d)));
-    if (selectedServoDevice && selectedServoDevice.id === deviceId) {
-      setSelectedServoDevice((prev) => (prev ? { ...prev, autoAdjustEnabled: enabled } : null));
-    }
-    persistDevice(deviceId, { autoAdjustEnabled: enabled }, 'Auto-PID mode');
-
-    const device = devices.find((d) => d.id === deviceId);
-    if (device?.ipAddress || device?.hostname) {
-      const target = resolveDeviceTarget(device);
-      sendAutoAdjustMode(target, enabled, device.id).catch((err) =>
-        console.warn(`[ESP32/Render] Failed to set auto-adjust mode:`, err.message)
-      );
-    }
-  };
-
-  const recordAutomation = useCallback(async (input: AutomationLogInput) => {
-    try {
-      const log = await rulesApi.recordLog(input);
-      setAutomationLogs((prev) => [log, ...prev].slice(0, AUTOMATION_LOG_LIMIT));
-    } catch (err) {
-      console.error(`[API] Could not record the automation event for ${input.device}:`, errorMessage(err));
-    }
-  }, []);
-
-  const handleToggleRelay = (deviceId: string, relay: 'AHU' | 'DHU1' | 'DHU2') => {
-    const device = devices.find((d) => d.id === deviceId);
-    if (!device) return;
-
-    const field = relay === 'AHU' ? 'ahuPowerOn' : relay === 'DHU1' ? 'dhu1On' : 'dhu2On';
-    const nextOn = !device[field];
-
-    setDevices((prev) => prev.map((d) => (d.id === deviceId ? { ...d, [field]: nextOn } : d)));
-    if (selectedServoDevice && selectedServoDevice.id === deviceId) {
-      setSelectedServoDevice((prev) => (prev ? { ...prev, [field]: nextOn } : null));
-    }
-
-    const relayPatch: DevicePatch = relay === 'AHU' ? { ahuPowerOn: nextOn } : relay === 'DHU1' ? { dhu1On: nextOn } : { dhu2On: nextOn };
-    persistDevice(deviceId, relayPatch, 'Relay state');
-
-    const relayLabel = relay === 'AHU' ? 'AHU Power' : relay === 'DHU1' ? 'DHU 1' : 'DHU 2';
-    const actorName = currentUserName || currentUserEmail || 'Unknown User';
-    void recordAutomation({
-      device: deviceId,
-      parameter: relay === 'AHU' ? 'Device Power' : 'Humidity Control',
-      anglePercent: nextOn ? 'ON' : 'OFF',
-      triggerReason: `${actorName}: ${relayLabel} ${nextOn ? 'ON' : 'OFF'}`,
-      isAutomatic: false,
-    });
-
-    if (device.ipAddress || device.hostname) {
-      const target = resolveDeviceTarget(device);
-      sendRelayCommand(target, relay, nextOn, device.id).catch((err) =>
-        console.warn(`[ESP32/Render] Failed to set ${relay} relay:`, err.message)
-      );
-    }
-  };
-
-  const handleUpdateServoValve = (deviceId: string, type: 'hot' | 'cold', percent: 0 | 25 | 50 | 75 | 100) => {
-    const angle = (percent / 100) * 180;
-
-    setDevices((prev) => prev.map((d) => {
-      if (d.id === deviceId) {
-        const updated = { ...d };
-        if (type === 'hot') { updated.hotValvePercent = percent; updated.hotValveAngle = angle; }
-        else { updated.coldValvePercent = percent; updated.coldValveAngle = angle; }
-        return updated;
-      }
-      return d;
-    }));
-
-    if (selectedServoDevice && selectedServoDevice.id === deviceId) {
-      setSelectedServoDevice((prev) => {
-        if (!prev) return null;
-        return {
-          ...prev,
-          hotValvePercent: type === 'hot' ? percent : prev.hotValvePercent,
-          hotValveAngle: type === 'hot' ? angle : prev.hotValveAngle,
-          coldValvePercent: type === 'cold' ? percent : prev.coldValvePercent,
-          coldValveAngle: type === 'cold' ? angle : prev.coldValveAngle,
-        };
-      });
-    }
-
-    persistDevice(deviceId, type === 'hot' ? { hotValvePercent: percent, hotValveAngle: angle } : { coldValvePercent: percent, coldValveAngle: angle }, 'Valve position');
-
-    const actorName = currentUserName || currentUserEmail || 'Unknown User';
-    void recordAutomation({
-      device: deviceId,
-      parameter: type === 'hot' ? 'Hot Supply Motor' : 'Cold Supply Motor',
-      anglePercent: `${percent}% (${angle}°)`,
-      triggerReason: `${actorName}: Manual Adjustment`,
-      isAutomatic: false,
-    });
-
-    const device = devices.find((d) => d.id === deviceId);
-    if (device?.ipAddress || device?.hostname) {
-      const target = resolveDeviceTarget(device);
-      sendServoCommand(target, type, percent, device.id).catch((err) =>
-        console.warn(`[ESP32/Render] Failed to send servo command:`, err.message)
-      );
-    }
-  };
-
-  const handleAddRule = (newRule: Omit<AutomationRule, 'id'>) => {
-    if (currentUserRole !== 'ADMIN') return;
-    void (async () => {
-      try {
-        const rule = await rulesApi.create({ ...newRule });
-        setAutomationRules((prev) => [...prev, rule]);
-      } catch (err) { console.error('[API] Could not create the rule:', errorMessage(err)); }
-    })();
-  };
-
-  const handleDeleteRule = (id: string) => {
-    if (currentUserRole !== 'ADMIN') return;
-    setAutomationRules((prev) => prev.filter((r) => r.id !== id));
-    void (async () => {
-      try { await rulesApi.remove(id); } catch (err) { await refreshRules(); }
-    })();
-  };
-
-  const handleToggleRule = (id: string) => {
-    if (currentUserRole !== 'ADMIN') return;
-    const rule = automationRules.find((r) => r.id === id);
-    if (!rule) return;
-    const next = !rule.enabled;
-    setAutomationRules((prev) => prev.map((r) => (r.id === id ? { ...r, enabled: next } : r)));
-    void (async () => {
-      try { await rulesApi.update(id, { enabled: next }); } catch (err) { await refreshRules(); }
-    })();
-  };
-
-  const handleAcknowledgeAlarm = (id: string) => {
-    setAlarms((prev) => prev.map((a) => (a.id === id ? { ...a, acknowledged: true } : a)));
-    void (async () => {
-      try { const saved = await alarmsApi.acknowledge(id); setAlarms((prev) => mergeAlarms(prev, [saved])); }
-      catch (err) { await refreshAlarms(); }
-    })();
-  };
-
-  const handleAcknowledgeAll = () => {
-    setAlarms((prev) => prev.map((a) => (a.acknowledged ? a : { ...a, acknowledged: true })));
-    void (async () => {
-      try { const saved = await alarmsApi.acknowledgeAll(); setAlarms((prev) => mergeAlarms(prev, saved)); }
-      catch (err) { await refreshAlarms(); }
-    })();
-  };
-
-  const handleDeleteAlarm = (id: string) => {
-    if (currentUserRole !== 'ADMIN') return;
-    setAlarms((prev) => prev.filter((a) => a.id !== id));
-    void (async () => { try { await alarmsApi.remove(id); } catch (err) { await refreshAlarms(); } })();
-  };
-
-  const openBreachesRef = useRef<Record<string, Record<ThresholdKey, boolean>>>({});
-
-  const playAlertBeep = () => {
-    try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return;
-      const ctx = new AudioCtx();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.value = 880;
-      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.4);
-      osc.onended = () => ctx.close();
-    } catch {}
-  };
-
-  const persistAlarmNow = useCallback(async (input: RaiseAlarmInput & { breachKey: ThresholdKey }) => {
-    try {
-      const existingAlarm = alarms.find((a) => a.device === input.device && a.parameter === input.parameter && a.category === 'REALTIME');
-      if (existingAlarm) return;
-      const { alarm } = await alarmsApi.raise(input);
-      setAlarms((prev) => mergeAlarms(prev, [alarm]));
-      playAlertBeep();
-    } catch (err) {
-      const state = openBreachesRef.current[input.device];
-      if (state) state[input.breachKey] = false;
-    }
-  }, [alarms]);
-
-  const raiseAlarm = useCallback((input: RaiseAlarmInput & { breachKey: ThresholdKey }) => {
-    const { device, breachKey } = input;
-    if (pendingPersistTimersRef.current[device]?.[breachKey]) return;
-
-    breachStartRef.current[device] = breachStartRef.current[device] || {};
-    breachStartRef.current[device][breachKey] = Date.now();
-    pendingPersistTimersRef.current[device] = pendingPersistTimersRef.current[device] || {};
-
-    const timer = window.setTimeout(() => {
-      pendingPersistTimersRef.current[device][breachKey] = null;
-      if (openBreachesRef.current[device]?.[breachKey] === true) void persistAlarmNow(input);
-    }, ALARM_PERSIST_DELAY_MS);
-
-    pendingPersistTimersRef.current[device][breachKey] = timer;
-  }, [persistAlarmNow]);
-
-  const clearAlarms = useCallback(async (device: string, breachKey?: ThresholdKey) => {
-    const keysToCancel: ThresholdKey[] = breachKey ? [breachKey] : [...THRESHOLD_KEYS];
-    for (const key of keysToCancel) {
-      const timer = pendingPersistTimersRef.current[device]?.[key];
-      if (timer) { window.clearTimeout(timer); pendingPersistTimersRef.current[device][key] = null; }
-      if (breachStartRef.current[device]) delete breachStartRef.current[device][key];
-    }
-    try {
-      const closed = await alarmsApi.resolve(device, breachKey);
-      setAlarms((prev) => mergeAlarms(prev, closed));
-    } catch (err) {}
-  }, []);
-
+  // ---------------------------------------------------------
+  // TELEMETRY POLLING (Fetches from Render)
+  // ---------------------------------------------------------
   const pollInFlightRef = useRef(false);
 
   useEffect(() => {
@@ -771,105 +154,27 @@ export default function App() {
         const merged = await pollAllDevices(currentDevices);
         if (cancelled) return;
 
-        const nowDate = new Date();
-        const automationIntents: AutomationLogInput[] = [];
-        const raiseIntents: Array<RaiseAlarmInput & { breachKey: ThresholdKey }> = [];
-        const clearIntents: Array<{ device: string; breachKey?: ThresholdKey }> = [];
-        const historySamples: HistorySample[] = [];
-        const valvePatches: Array<{ device: string; patch: DevicePatch }> = [];
-
         const patches: Record<string, Partial<DeviceData>> = {};
-        const newHistoryPoints: Record<string, HistoryDataPoint> = {};
-
+        
         currentDevices.forEach((prevDev) => {
           const fresh = merged.find((m) => m.id === prevDev.id);
-          const deviceId = prevDev.id;
-
           if (!fresh || !fresh.isOnline) {
-            patches[deviceId] = { isOnline: false, tempReal: null, humidityReal: null, lastUpdated: new Date().toLocaleTimeString() };
-            return;
+            patches[prevDev.id] = { isOnline: false, tempReal: null, humidityReal: null };
           } else {
-            patches[deviceId] = { isOnline: true, tempReal: fresh.tempReal, humidityReal: fresh.humidityReal, lastUpdated: fresh.lastUpdated };
-          }
-
-          const currentPatch = patches[deviceId]!;
-          const currentTemp = currentPatch.tempReal ?? null;
-          const currentHum = currentPatch.humidityReal ?? null;
-          if (currentTemp === null || currentHum === null) return;
-
-          automationRules.filter((r) => r.enabled && r.device === deviceId).forEach((rule) => {
-            const sensorVal = rule.parameter === 'Temperature' ? currentTemp : currentHum;
-            const triggered = rule.condition === 'GREATER_THAN' ? sensorVal > rule.threshold : sensorVal < rule.threshold;
-            if (!triggered) return;
-
-            const isHot = rule.targetSupply === 'HOT';
-            const currentPercent = isHot ? prevDev.hotValvePercent : prevDev.coldValvePercent;
-            if (currentPercent === rule.targetValvePercent) return;
-
-            const newAngle = (rule.targetValvePercent / 100) * 180;
-            if (isHot) {
-              patches[deviceId] = { ...patches[deviceId], hotValvePercent: rule.targetValvePercent, hotValveAngle: newAngle };
-            } else {
-              patches[deviceId] = { ...patches[deviceId], coldValvePercent: rule.targetValvePercent, coldValveAngle: newAngle };
-            }
-
-            if (prevDev.ipAddress || prevDev.hostname) {
-              const target = resolveDeviceTarget(prevDev);
-              sendServoCommand(target, isHot ? 'hot' : 'cold', rule.targetValvePercent, prevDev.id).catch();
-            }
-            valvePatches.push({ device: deviceId, patch: isHot ? { hotValvePercent: rule.targetValvePercent, hotValveAngle: newAngle } : { coldValvePercent: rule.targetValvePercent, coldValveAngle: newAngle } });
-            automationIntents.push({ device: deviceId, parameter: isHot ? 'Hot Supply Motor' : 'Cold Supply Motor', anglePercent: `${rule.targetValvePercent}% (${newAngle}°)`, triggerReason: `Auto Rule`, isAutomatic: true, occurredAt: nowDate.getTime() });
-          });
-
-          const breachState = openBreachesRef.current[deviceId] || { tempHigh: false, tempLow: false, humHigh: false, humLow: false };
-          openBreachesRef.current[deviceId] = breachState;
-
-          const evaluate = (key: ThresholdKey, isBreached: boolean, alarmName: string, parameter: AlarmLog['parameter'], lowHigh: AlarmLog['lowHigh'], value: string) => {
-            if (isBreached && !breachState[key]) {
-              breachState[key] = true;
-              raiseIntents.push({ device: deviceId, alarmName, parameter, lowHigh, value, breachKey: key, ipAddress: prevDev.ipAddress || null, occurredAt: nowDate.getTime() });
-            } else if (!isBreached && breachState[key]) {
-              breachState[key] = false;
-              clearIntents.push({ device: deviceId, breachKey: key });
-            }
-          };
-
-          evaluate('tempHigh', currentTemp > prevDev.tempMax, 'TEMPERATURE HIGH LIMIT EXCEEDED', 'Temperature', 'High', `${currentTemp} °C`);
-          evaluate('tempLow', currentTemp < prevDev.tempMin, 'TEMPERATURE LOW LIMIT EXCEEDED', 'Temperature', 'Low', `${currentTemp} °C`);
-          evaluate('humHigh', currentHum > prevDev.humidityMax, 'HUMIDITY HIGH LIMIT EXCEEDED', 'Humidity', 'High', `${currentHum} %`);
-          evaluate('humLow', currentHum < prevDev.humidityMin, 'HUMIDITY LOW LIMIT EXCEEDED', 'Humidity', 'Low', `${currentHum} %`);
-
-          const lastSample = lastHistorySampleRef.current[deviceId] || 0;
-          if (nowDate.getTime() - lastSample >= HISTORY_SAMPLE_INTERVAL_MS) {
-            lastHistorySampleRef.current[deviceId] = nowDate.getTime();
-            newHistoryPoints[deviceId] = {
-              time: nowDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-              timestamp: nowDate.getTime(), device: deviceId, temperature: currentTemp, humidity: currentHum,
-              hotServoAngle: fresh.hotValveAngle, coldServoAngle: fresh.coldValveAngle,
+            patches[prevDev.id] = { 
+              isOnline: true, 
+              tempReal: fresh.tempReal, 
+              humidityReal: fresh.humidityReal,
+              ahuPowerOn: fresh.ahuPowerOn,
+              dhu1On: fresh.dhu1On,
+              dhu2On: fresh.dhu2On,
             };
-            historySamples.push({ device: deviceId, temperature: currentTemp, humidity: currentHum, hotServoAngle: fresh.hotValveAngle, coldServoAngle: fresh.coldValveAngle, recordedAt: nowDate.getTime() });
           }
         });
 
         if (cancelled) return;
         setDevices((prev) => prev.map((pd) => (patches[pd.id] ? { ...pd, ...patches[pd.id] } : pd)));
 
-        if (Object.keys(newHistoryPoints).length) {
-          const cutoff = nowDate.getTime() - HISTORY_RETENTION_MS;
-          setDeviceHistory((prev) => {
-            const next = { ...prev };
-            Object.entries(newHistoryPoints).forEach(([id, pt]) => { next[id] = [...(next[id] || []).filter(p => p.timestamp >= cutoff), pt]; });
-            return next;
-          });
-        }
-
-        await Promise.all([
-          ...raiseIntents.map((intent) => Promise.resolve(raiseAlarm(intent))),
-          ...clearIntents.map((intent) => clearAlarms(intent.device, intent.breachKey)),
-          ...automationIntents.map((intent) => recordAutomation(intent)),
-          ...valvePatches.map(async ({ device, patch }) => { try { await devicesApi.update(device, patch); } catch (e) {} }),
-          historySamples.length > 0 ? devicesApi.recordHistory(historySamples).catch(() => {}) : Promise.resolve(),
-        ]);
       } finally {
         pollInFlightRef.current = false;
       }
@@ -878,7 +183,44 @@ export default function App() {
     void pollHardware();
     const interval = setInterval(() => { void pollHardware(); }, TELEMETRY_POLL_INTERVAL_MS);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [isLiveUpdating, isLoggedIn, automationRules]);
+  }, [isLiveUpdating, isLoggedIn]);
+
+  // ---------------------------------------------------------
+  // COMMANDS (Sends to Render)
+  // ---------------------------------------------------------
+  const handleToggleRelay = async (deviceId: string, relay: 'AHU' | 'DHU1' | 'DHU2') => {
+    const device = devices.find((d) => d.id === deviceId);
+    if (!device) return;
+
+    const field = relay === 'AHU' ? 'ahuPowerOn' : relay === 'DHU1' ? 'dhu1On' : 'dhu2On';
+    const nextOn = !device[field];
+
+    setDevices((prev) => prev.map((d) => (d.id === deviceId ? { ...d, [field]: nextOn } : d)));
+    
+    await sendRelayCommand(resolveDeviceTarget(device), relay, nextOn, device.id);
+  };
+
+  const handleUpdateServoValve = async (deviceId: string, type: 'hot' | 'cold', percent: any) => {
+    const angle = (percent / 100) * 180;
+    setDevices((prev) => prev.map((d) => {
+      if (d.id === deviceId) {
+        const updated = { ...d };
+        if (type === 'hot') { updated.hotValvePercent = percent; updated.hotValveAngle = angle; }
+        else { updated.coldValvePercent = percent; updated.coldValveAngle = angle; }
+        return updated;
+      }
+      return d;
+    }));
+
+    const device = devices.find((d) => d.id === deviceId);
+    if (device) await sendServoCommand(resolveDeviceTarget(device), type, percent, device.id);
+  };
+
+  const handleToggleAutoAdjust = async (deviceId: string, enabled: boolean) => {
+    setDevices((prev) => prev.map((d) => (d.id === deviceId ? { ...d, autoAdjustEnabled: enabled } : d)));
+    const device = devices.find((d) => d.id === deviceId);
+    if (device) await sendAutoAdjustMode(resolveDeviceTarget(device), enabled, device.id);
+  };
 
   const unackAlarmCount = alarms.filter((a) => !a.acknowledged && a.category === 'REALTIME').length;
 
@@ -894,12 +236,12 @@ export default function App() {
           <LoginView onLoginSuccess={handleLoginSuccess} setActiveTab={setActiveTab} isLoggedIn={isLoggedIn} currentUserEmail={currentUserEmail} onLogout={handleLogout} />
         ) : (
           <>
-            {activeTab === 'REAL TIME DATA' && <RealTimeDataView devices={devices} userRole={currentUserRole} onUpdateDeviceName={handleUpdateDeviceName} onUpdateDeviceRoom={handleUpdateDeviceRoom} onUpdateDeviceThresholds={handleUpdateDeviceThresholds} onToggleDeviceOnline={handleToggleDeviceOnline} />}
-            {activeTab === 'ESP32 CONFIG' && <Esp32ConfigView devices={devices} userRole={currentUserRole} onUpdateDeviceIp={handleUpdateDeviceIp} onUpdateDeviceName={handleUpdateDeviceName} onUpdateDeviceHostname={handleUpdateDeviceHostname} onToggleAutoAdjust={handleToggleAutoAdjust} onToggleDeviceOnline={handleToggleDeviceOnline} onScanNetwork={handleScanNetwork} lastScanResult={lastScanResult} isAutoScanEnabled={autoScanEnabled} onAddDevice={handleAddDevice} onRemoveDevice={handleRemoveDevice} maxDevices={MAX_DEVICES} scanSubnet={scanSubnet} onScanSubnetChange={handleScanSubnetChange} />}
+            {activeTab === 'REAL TIME DATA' && <RealTimeDataView devices={devices} userRole={currentUserRole} onUpdateDeviceName={() => {}} onUpdateDeviceRoom={() => {}} onUpdateDeviceThresholds={() => {}} onToggleDeviceOnline={() => {}} />}
+            {activeTab === 'ESP32 CONFIG' && <Esp32ConfigView devices={devices} userRole={currentUserRole} onUpdateDeviceIp={() => {}} onToggleAutoAdjust={handleToggleAutoAdjust} onToggleDeviceOnline={() => {}} onScanNetwork={async () => ({ found: 0, assigned: 0, updated: 0, messages: [] })} />}
             {activeTab === 'DHU CONTROL' && <DhuControlView devices={devices} onToggleRelay={handleToggleRelay} />}
-            {activeTab === 'AUDIT LOG' && <AuditLogView auditLogs={auditLogs} userRole={currentUserRole} />}
-            {activeTab === 'AUTOMATION' && <AutomationView devices={devices} userRole={currentUserRole} onUpdateServoValve={handleUpdateServoValve} onOpenServoModal={(dev) => setSelectedServoDevice(dev)} automationRules={automationRules} onAddRule={handleAddRule} onDeleteRule={handleDeleteRule} onToggleRule={handleToggleRule} onToggleAutoAdjust={handleToggleAutoAdjust} />}
-            {activeTab === 'ALARM' && <AlarmView alarms={alarms} onAcknowledgeAlarm={handleAcknowledgeAlarm} onAcknowledgeAll={handleAcknowledgeAll} onDeleteAlarm={handleDeleteAlarm} onNavigateToReport={() => setActiveTab('ALARM REPORT')} />}
+            {activeTab === 'AUDIT LOG' && <AuditLogView auditLogs={[]} userRole={currentUserRole} />}
+            {activeTab === 'AUTOMATION' && <AutomationView devices={devices} userRole={currentUserRole} onUpdateServoValve={handleUpdateServoValve} onOpenServoModal={(dev) => setSelectedServoDevice(dev)} automationRules={automationRules} onAddRule={() => {}} onDeleteRule={() => {}} onToggleRule={() => {}} onToggleAutoAdjust={handleToggleAutoAdjust} />}
+            {activeTab === 'ALARM' && <AlarmView alarms={alarms} onAcknowledgeAlarm={() => {}} onAcknowledgeAll={() => {}} onDeleteAlarm={() => {}} onNavigateToReport={() => setActiveTab('ALARM REPORT')} />}
             {activeTab === 'GRAPH' && <GraphView devices={devices} deviceHistory={deviceHistory} />}
             {activeTab === 'ALARM REPORT' && <AlarmReportView alarms={alarms} devices={devices} generatedBy={currentUserName || currentUserEmail} />}
           </>
