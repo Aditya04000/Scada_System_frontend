@@ -2,6 +2,9 @@ import { DeviceData } from '../types';
 
 const API_URL = import.meta.env.VITE_API_URL || 'https://scada-system-backend.onrender.com';
 
+// ---------------------------------------------------------
+// TYPES
+// ---------------------------------------------------------
 export interface Esp32TelemetryResponse {
   ip: string;
   tempReal: number | null;
@@ -24,12 +27,12 @@ export class Esp32CommunicationError extends Error {
 }
 
 // ---------------------------------------------------------
-// POLLING (Fetch from Render)
+// FETCH DATA FROM RENDER
 // ---------------------------------------------------------
-
 export async function fetchDeviceTelemetry(ipAddress: string, device?: DeviceData): Promise<Esp32TelemetryResponse> {
-  if (!device?.id) throw new Esp32CommunicationError('No device ID', ipAddress);
+  if (!device?.id) throw new Esp32CommunicationError('No device ID provided', ipAddress);
 
+  // Query Render directly
   const res = await fetch(`${API_URL}/api/device-sync/telemetry?deviceId=${encodeURIComponent(device.id)}`);
   
   if (!res.ok) throw new Esp32CommunicationError('HTTP Error', ipAddress);
@@ -41,6 +44,7 @@ export async function fetchDeviceTelemetry(ipAddress: string, device?: DeviceDat
     throw new Esp32CommunicationError('Device offline in cloud', ipAddress);
   }
 
+  // Convert Render format to Local format for the UI
   return {
     ip: 'Cloud',
     tempReal: data.temp ?? null,
@@ -64,6 +68,7 @@ export async function pollAllDevices(devices: DeviceData[]): Promise<DeviceData[
   return devices.map((dev, idx) => {
     const result = results[idx];
     if (result.status === 'rejected') {
+      // Return offline if Render returns no data
       return { ...dev, isOnline: false, tempReal: null, humidityReal: null }; 
     }
 
@@ -87,9 +92,8 @@ export async function pollAllDevices(devices: DeviceData[]): Promise<DeviceData[
 }
 
 // ---------------------------------------------------------
-// COMMANDS (Send to Render)
+// SEND COMMANDS TO RENDER
 // ---------------------------------------------------------
-
 export async function sendServoCommand(ipAddress: string, type: 'hot' | 'cold', percent: number, deviceId?: string): Promise<void> {
   if (!deviceId) return;
   const commandKey = type === 'hot' ? 'hotPercent' : 'coldPercent';
@@ -124,16 +128,13 @@ export async function pingDevice(ipAddress: string): Promise<{ ok: boolean; late
 }
 
 // ---------------------------------------------------------
-// SCANNER (Disabled on Vercel)
+// FALLBACKS (To prevent TS errors in App.tsx)
 // ---------------------------------------------------------
-
 export function resolveDeviceTarget(device: { ipAddress: string; hostname?: string }): string {
-  return device.ipAddress; // Not used in cloud mode
+  return device.ipAddress; 
 }
 
 export async function scanSubnetForDevices(subnetPrefix: string): Promise<any[]> {
-  // Browsers block HTTP scanning from HTTPS Vercel apps.
-  // Return empty so the UI doesn't crash, but log a warning.
-  console.warn("Local network scanning is blocked by the browser on Vercel.");
+  console.warn("Local network scanning is disabled when using Vercel.");
   return [];
 }
